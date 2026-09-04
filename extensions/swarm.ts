@@ -1,0 +1,345 @@
+/**
+ * @pify/swarm — coordinate multiple pi agents working in parallel.
+ *
+ * swarm_run fans a list of task items out to child agents (the same
+ * in-process createAgentSession runner proven in @pify/subagent), with a
+ * concurrency queue, per-item auto-routing via agent-def match_patterns /
+ * match_keywords (gjczone's model), a live widget, and an aggregated
+ * report. Blocking by default; background: true returns a runId polled
+ * with swarm_status. Items are independent — no shared state, no nesting.
+ *
+ * Reads the SAME .pi/agents/*.md definitions as @pify/subagent (plus the
+ * two routing keys), so one agent catalog serves both packages.
+ */
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  SessionManager,
+  type AgentSession,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+
+import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { parseAgentFile } from "../src/frontmatter.ts";
+import { buildReport, buildStatusLine } from "../src/report.ts";
+import { routeItem } from "../src/routing.ts";
+import { buildWidgetLines } from "../src/widget.ts";
+import {
+  DEFAULT_CONCURRENCY,
+  MAX_ITEMS,
+  isRecord,
+  type AgentDef,
+  type ItemState,
+  type SwarmRun,
+} from "../src/types.ts";
+import { readFileSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
+
+const RUN_ENTRY = "swarm-run";
+
+type UiContext = ExtensionContext;
+
+function loadDefs(cwd: string, agentDir: string): Map<string, AgentDef> {
+  const defs = new Map<string, AgentDef>();
+  for (const [name, content] of Object.entries(BUILTIN_AGENTS)) {
+    const def = parseAgentFile(name, content, "builtin");
+    if (def) defs.set(def.name, def);
+  }
+  for (const [dir, source] of [
+    [join(agentDir, "agents"), "global"],
+    [join(cwd, ".pi", "agents"), "project"],
+  ] as const) {
+    try {
+      for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
+        try {
+          const def = parseAgentFile(basename(file, ".md"), readFileSync(join(dir, file), "utf8"), source);
+          if (def) defs.set(def.name, def);
+        } catch {
+          // skip unreadable
+        }
+      }
+    } catch {
+      // dir missing
+    }
+  }
+  return defs;
+}
+
+export default function swarm(pi: ExtensionAPI) {
+  let defs = new Map<string, AgentDef>();
+  const runs = new Map<string, SwarmRun>();
+  let activeRun: SwarmRun | null = null;
+  let runCounter = 0;
+  let lastUiCtx: UiContext | null = null;
+
+  function renderWidget(ctx: UiContext | null = lastUiCtx): void {
+    if (!ctx || !ctx.hasUI) return;
+    lastUiCtx = ctx;
+    const run = activeRun;
+    const now = Date.now();
+    if (!run || (run.status === "done" && (run.finishedAt ?? 0) < now - 15_000)) {
+      ctx.ui.setWidget("swarm", undefined);
+      return;
+    }
+    ctx.ui.setWidget(
+      "swarm",
+      (_tui: unknown, theme: { fg(c: string, s: string): string; bold(s: string): string }) =>
+        new Text(buildWidgetLines(run, theme, Date.now()).join("\n"), 0, 0),
+      { placement: "aboveEditor" },
+    );
+  }
+
+  function notify(ctx: UiContext, message: string, level: "info" | "warning" | "error"): void {
+    if (ctx.hasUI) ctx.ui.notify(message, level);
+  }
+
+  // ── Child runner (subagent-proven pattern, one per item) ─────────────
+
+  async function runItem(ctx: UiContext, def: AgentDef, item: ItemState, context: string): Promise<void> {
+    item.status = "running";
+    renderWidget();
+    let session: AgentSession | null = null;
+    let unsubscribe: (() => void) | null = null;
+    try {
+      let model = ctx.model ?? null;
+      if (def.model) {
+        const [provider, ...rest] = def.model.split("/");
+        const found =
+          provider && rest.length > 0 ? ctx.modelRegistry.find(provider, rest.join("/")) : undefined;
+        if (found) model = found;
+      }
+      if (!model) throw new Error("No model available");
+
+      const promptHost = ctx as unknown as {
+        getSystemPromptOptions?: () => { customPrompt?: string; appendSystemPrompt?: string };
+      };
+      const promptOptions = promptHost.getSystemPromptOptions?.() ?? {};
+
+      const created = await createAgentSession({
+        sessionManager: SessionManager.inMemory(ctx.cwd),
+        model,
+        thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
+        tools: def.tools,
+        resourceLoader: new DefaultResourceLoader({
+          cwd: ctx.cwd,
+          agentDir: getAgentDir(),
+          noExtensions: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          systemPrompt: promptOptions.customPrompt,
+          appendSystemPrompt: [
+            ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
+            def.systemPrompt,
+            "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — make it complete and self-contained.",
+          ],
+        }),
+      });
+      session = created.session;
+
+      unsubscribe = session.subscribe((event) => {
+        if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
+          item.turns++;
+          const usage = (event as { message?: { usage?: { totalTokens?: number } } }).message?.usage;
+          if (usage && typeof usage.totalTokens === "number") item.tokens += usage.totalTokens;
+          renderWidget();
+          if (item.turns >= def.maxTurns) void session?.abort().catch(() => {});
+        }
+      });
+
+      const prompt = context ? `${context.trim()}\n\nYour item: ${item.item}` : item.item;
+      await session.prompt(prompt, { source: "extension" } as never);
+
+      const messages = session.messages as Array<{
+        role?: string;
+        stopReason?: unknown;
+        content?: Array<{ type?: string; text?: string }>;
+      }>;
+      const last = [...messages].reverse().find((m) => m.role === "assistant");
+      const text = (last?.content ?? [])
+        .filter((c) => c.type === "text" && typeof c.text === "string")
+        .map((c) => c.text)
+        .join("\n")
+        .trim();
+
+      item.result = text || null;
+      item.status =
+        last?.stopReason === "aborted" ? "aborted" : last?.stopReason === "error" ? "error" : "done";
+      if (item.status === "error") item.error = text || "child session error";
+    } catch (err) {
+      item.status = "error";
+      item.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      if (unsubscribe) {
+        try {
+          unsubscribe();
+        } catch {
+          // gone
+        }
+      }
+      if (session) {
+        try {
+          session.dispose();
+        } catch {
+          // fine
+        }
+      }
+      renderWidget();
+    }
+  }
+
+  /** Pool executor: at most DEFAULT_CONCURRENCY items in flight. */
+  async function executeRun(ctx: UiContext, run: SwarmRun, context: string, fixed?: string): Promise<void> {
+    const queue = [...run.items];
+    const workers = Array.from({ length: Math.min(DEFAULT_CONCURRENCY, queue.length) }, async () => {
+      for (;;) {
+        const item = queue.shift();
+        if (!item) return;
+        const def = routeItem(item.item, defs, fixed);
+        item.agent = def.name;
+        await runItem(ctx, def, item, context);
+      }
+    });
+    await Promise.all(workers);
+    run.status = "done";
+    run.finishedAt = Date.now();
+    pi.appendEntry(RUN_ENTRY, run);
+    renderWidget();
+  }
+
+  // ── Tools ────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "swarm_run",
+    label: "Run swarm",
+    description:
+      `Fan out 1-${MAX_ITEMS} independent task items to parallel child agents (concurrency ${DEFAULT_CONCURRENCY}). ` +
+      "Each item auto-routes to an agent type via its match_patterns/match_keywords, falling back to the " +
+      "read-only scout; set agent to force one type for all items. context is prepended to every item. " +
+      "Blocking by default (returns the aggregated report); background=true returns a runId for swarm_status. " +
+      "Write each item as a self-contained brief — children see nothing else.",
+    parameters: Type.Object({
+      items: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_ITEMS }),
+      context: Type.Optional(Type.String({ description: "Shared preamble for every item" })),
+      agent: Type.Optional(Type.String({ description: "Force one agent type for all items" })),
+      background: Type.Optional(Type.Boolean()),
+    }),
+    async execute(
+      _id,
+      params: { items: string[]; context?: string; agent?: string; background?: boolean },
+      _signal,
+      _onUpdate,
+      ctx,
+    ) {
+      const uiCtx = ctx as UiContext;
+      const items = params.items.map((s) => s.trim()).filter(Boolean);
+      if (items.length === 0) throw new Error("swarm_run requires at least one non-empty item.");
+      if (params.agent && !defs.has(params.agent.toLowerCase())) {
+        throw new Error(`Unknown agent type "${params.agent}". Available: ${[...defs.keys()].sort().join(", ")}`);
+      }
+      if (activeRun?.status === "running") {
+        throw new Error(`Swarm ${activeRun.runId} is still running — wait or check swarm_status.`);
+      }
+
+      runCounter++;
+      const run: SwarmRun = {
+        runId: `s${runCounter}`,
+        background: params.background === true,
+        status: "running",
+        startedAt: Date.now(),
+        finishedAt: null,
+        items: items.map((item, index) => ({
+          index,
+          item,
+          agent: params.agent?.toLowerCase() ?? "?",
+          status: "queued",
+          turns: 0,
+          tokens: 0,
+          result: null,
+          error: null,
+        })),
+      };
+      runs.set(run.runId, run);
+      activeRun = run;
+      renderWidget(uiCtx);
+
+      if (run.background) {
+        void executeRun(uiCtx, run, params.context ?? "", params.agent).then(() => {
+          notify(uiCtx, `swarm ${run.runId} finished — collect with swarm_status`, "info");
+        });
+        return {
+          content: [
+            { type: "text", text: `Swarm ${run.runId} started (${items.length} items). Poll swarm_status runId="${run.runId}".` },
+          ],
+          details: { runId: run.runId },
+        };
+      }
+
+      await executeRun(uiCtx, run, params.context ?? "", params.agent);
+      return {
+        content: [{ type: "text", text: buildReport(run) }],
+        details: { runId: run.runId },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "swarm_status",
+    label: "Swarm status",
+    description: "Progress of a swarm run (default: the latest). Returns the full report when finished.",
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params: { runId?: string }) {
+      const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
+      if (!run) throw new Error("No swarm runs this session.");
+      const text = run.status === "done" ? buildReport(run) : buildStatusLine(run);
+      return { content: [{ type: "text", text }], details: { runId: run.runId, status: run.status } };
+    },
+  });
+
+  // ── Lifecycle & command ──────────────────────────────────────────────
+
+  pi.on("session_start", async (_event, ctx) => {
+    defs = loadDefs(ctx.cwd, getAgentDir());
+    runs.clear();
+    activeRun = null;
+    for (const entry of ctx.sessionManager.getBranch()) {
+      const e = entry as { type?: string; customType?: string; data?: unknown };
+      if (e.type !== "custom" || e.customType !== RUN_ENTRY || !isRecord(e.data)) continue;
+      const run = e.data as unknown as SwarmRun;
+      if (typeof run.runId === "string" && run.status === "done") {
+        runs.set(run.runId, run);
+        const n = Number.parseInt(run.runId.slice(1), 10);
+        if (Number.isFinite(n) && n > runCounter) runCounter = n;
+      }
+    }
+    renderWidget(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (ctx.hasUI) ctx.ui.setWidget("swarm", undefined);
+  });
+
+  pi.registerCommand("swarm", {
+    description: "Show swarm runs and routing-capable agent types",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) return;
+      const routed = [...defs.values()]
+        .map((d) => {
+          const rules = [
+            ...d.matchPatterns.map((p) => `glob:${p}`),
+            ...d.matchKeywords.map((k) => `kw:${k}`),
+          ].join(", ");
+          return `${d.name} (${d.source})${rules ? ` [${rules}]` : ""}`;
+        })
+        .join("\n");
+      const runLines =
+        [...runs.values()].map((r) => buildStatusLine(r)).join("\n") || "(no runs yet)";
+      ctx.ui.notify(`Agent types\n${routed}\n\nRuns\n${runLines}`, "info");
+    },
+  });
+}
