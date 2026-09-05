@@ -24,6 +24,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { createIsolationWorktree, isolationNote } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
 import { routeItem } from "../src/routing.ts";
@@ -99,7 +100,7 @@ export default function swarm(pi: ExtensionAPI) {
 
   // ── Child runner (subagent-proven pattern, one per item) ─────────────
 
-  async function runItem(ctx: UiContext, def: AgentDef, item: ItemState, context: string): Promise<void> {
+  async function runItem(ctx: UiContext, def: AgentDef, item: ItemState, context: string, workDir?: string): Promise<void> {
     item.status = "running";
     renderWidget();
     let session: AgentSession | null = null;
@@ -120,12 +121,12 @@ export default function swarm(pi: ExtensionAPI) {
       const promptOptions = promptHost.getSystemPromptOptions?.() ?? {};
 
       const created = await createAgentSession({
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager: SessionManager.inMemory(workDir ?? ctx.cwd),
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
         tools: def.tools,
         resourceLoader: new DefaultResourceLoader({
-          cwd: ctx.cwd,
+          cwd: workDir ?? ctx.cwd,
           agentDir: getAgentDir(),
           noExtensions: true,
           noPromptTemplates: true,
@@ -192,7 +193,7 @@ export default function swarm(pi: ExtensionAPI) {
   }
 
   /** Pool executor: at most DEFAULT_CONCURRENCY items in flight. */
-  async function executeRun(ctx: UiContext, run: SwarmRun, context: string, fixed?: string): Promise<void> {
+  async function executeRun(ctx: UiContext, run: SwarmRun, context: string, fixed?: string, isolate?: boolean): Promise<void> {
     const queue = [...run.items];
     const workers = Array.from({ length: Math.min(DEFAULT_CONCURRENCY, queue.length) }, async () => {
       for (;;) {
@@ -200,7 +201,20 @@ export default function swarm(pi: ExtensionAPI) {
         if (!item) return;
         const def = routeItem(item.item, defs, fixed);
         item.agent = def.name;
-        await runItem(ctx, def, item, context);
+        if (isolate) {
+          try {
+            const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
+            await runItem(ctx, def, item, context, iso.path);
+            if (item.result !== null) item.result = item.result + "
+
+" + isolationNote(iso);
+          } catch (err) {
+            item.status = "error";
+            item.error = err instanceof Error ? err.message : String(err);
+          }
+        } else {
+          await runItem(ctx, def, item, context);
+        }
       }
     });
     await Promise.all(workers);
@@ -220,16 +234,18 @@ export default function swarm(pi: ExtensionAPI) {
       "Each item auto-routes to an agent type via its match_patterns/match_keywords, falling back to the " +
       "read-only scout; set agent to force one type for all items. context is prepended to every item. " +
       "Blocking by default (returns the aggregated report); background=true returns a runId for swarm_status. " +
-      "Write each item as a self-contained brief — children see nothing else.",
+      "Write each item as a self-contained brief — children see nothing else. For MUTATING items set " +
+      "isolation=worktree: each item gets its own git worktree and branch; reports say how to merge.",
     parameters: Type.Object({
       items: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_ITEMS }),
       context: Type.Optional(Type.String({ description: "Shared preamble for every item" })),
       agent: Type.Optional(Type.String({ description: "Force one agent type for all items" })),
+      isolation: Type.Optional(Type.String({ description: "Set to worktree to give each item its own git worktree (for mutating items)" })),
       background: Type.Optional(Type.Boolean()),
     }),
     async execute(
       _id,
-      params: { items: string[]; context?: string; agent?: string; background?: boolean },
+      params: { items: string[]; context?: string; agent?: string; background?: boolean; isolation?: string },
       _signal,
       _onUpdate,
       ctx,
@@ -267,7 +283,7 @@ export default function swarm(pi: ExtensionAPI) {
       renderWidget(uiCtx);
 
       if (run.background) {
-        void executeRun(uiCtx, run, params.context ?? "", params.agent).then(() => {
+        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree").then(() => {
           notify(uiCtx, `swarm ${run.runId} finished — collect with swarm_status`, "info");
         });
         return {
@@ -278,7 +294,7 @@ export default function swarm(pi: ExtensionAPI) {
         };
       }
 
-      await executeRun(uiCtx, run, params.context ?? "", params.agent);
+      await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree");
       return {
         content: [{ type: "text", text: buildReport(run) }],
         details: { runId: run.runId },
