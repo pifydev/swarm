@@ -205,9 +205,7 @@ export default function swarm(pi: ExtensionAPI) {
           try {
             const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
             await runItem(ctx, def, item, context, iso.path);
-            if (item.result !== null) item.result = item.result + "
-
-" + isolationNote(iso);
+            if (item.result !== null) item.result = `${item.result}\n\n${isolationNote(iso)}`;
           } catch (err) {
             item.status = "error";
             item.error = err instanceof Error ? err.message : String(err);
