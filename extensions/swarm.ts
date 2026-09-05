@@ -17,6 +17,7 @@ import {
   getAgentDir,
   SessionManager,
   type AgentSession,
+  type ToolDefinition,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -25,6 +26,7 @@ import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { createIsolationWorktree, isolationNote } from "../src/isolate.ts";
+import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
 import { routeItem } from "../src/routing.ts";
@@ -100,7 +102,59 @@ export default function swarm(pi: ExtensionAPI) {
 
   // ── Child runner (subagent-proven pattern, one per item) ─────────────
 
-  async function runItem(ctx: UiContext, def: AgentDef, item: ItemState, context: string, workDir?: string): Promise<void> {
+  /**
+   * Mailbox tools for one child. Each agent posts under its own label and
+   * never sees its own posts echoed back; `seen` advances per agent so a
+   * second swarm_inbox only reports what arrived since the first.
+   */
+  function mailboxTools(dir: string, label: string): ToolDefinition[] {
+    let seen = 0;
+    return [
+      {
+        name: "swarm_post",
+        label: "Post to swarm",
+        description:
+          "Tell the other agents in this swarm something that changes their work: a shared file you " +
+          "modified, a convention you had to choose, a blocker they will hit too. Not for progress " +
+          "narration — only facts a sibling needs to avoid redoing or undoing your work.",
+        parameters: Type.Object({
+          message: Type.String({ description: "One fact the other agents need" }),
+        }),
+        async execute(_id: string, params: { message: string }) {
+          const posted = postMessage(dir, label, params.message, Date.now());
+          return {
+            content: [{ type: "text", text: `Posted #${posted.seq} to the swarm.` }],
+            details: { seq: posted.seq },
+          };
+        },
+      },
+      {
+        name: "swarm_inbox",
+        label: "Read swarm inbox",
+        description:
+          "Read what the other agents in this swarm have posted since you last checked. Call it " +
+          "before you start working and again before you finish.",
+        parameters: Type.Object({}),
+        async execute() {
+          const read = readInbox(dir, label, seen);
+          seen = read.nextSeq;
+          return {
+            content: [{ type: "text", text: formatInbox(read) }],
+            details: { count: read.messages.length },
+          };
+        },
+      },
+    ] as unknown as ToolDefinition[];
+  }
+
+  async function runItem(
+    ctx: UiContext,
+    def: AgentDef,
+    item: ItemState,
+    context: string,
+    workDir?: string,
+    mailbox?: string,
+  ): Promise<void> {
     item.status = "running";
     renderWidget();
     let session: AgentSession | null = null;
@@ -125,6 +179,7 @@ export default function swarm(pi: ExtensionAPI) {
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
         tools: def.tools,
+        ...(mailbox ? { customTools: mailboxTools(mailbox, item.agent + "-" + item.index) } : {}),
         resourceLoader: new DefaultResourceLoader({
           cwd: workDir ?? ctx.cwd,
           agentDir: getAgentDir(),
@@ -136,6 +191,7 @@ export default function swarm(pi: ExtensionAPI) {
             ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
             def.systemPrompt,
             "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — make it complete and self-contained.",
+            ...(mailbox ? [mailboxPrompt(item.agent + "-" + item.index)] : []),
           ],
         }),
       });
@@ -193,7 +249,16 @@ export default function swarm(pi: ExtensionAPI) {
   }
 
   /** Pool executor: at most DEFAULT_CONCURRENCY items in flight. */
-  async function executeRun(ctx: UiContext, run: SwarmRun, context: string, fixed?: string, isolate?: boolean): Promise<void> {
+  async function executeRun(
+    ctx: UiContext,
+    run: SwarmRun,
+    context: string,
+    fixed?: string,
+    isolate?: boolean,
+    useMailbox?: boolean,
+  ): Promise<void> {
+    // One shared log per run; only created when the caller asked for it.
+    const mailbox = useMailbox ? mailboxDir(getAgentDir(), run.runId) : undefined;
     const queue = [...run.items];
     const workers = Array.from({ length: Math.min(DEFAULT_CONCURRENCY, queue.length) }, async () => {
       for (;;) {
@@ -204,14 +269,14 @@ export default function swarm(pi: ExtensionAPI) {
         if (isolate) {
           try {
             const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
-            await runItem(ctx, def, item, context, iso.path);
+            await runItem(ctx, def, item, context, iso.path, mailbox);
             if (item.result !== null) item.result = `${item.result}\n\n${isolationNote(iso)}`;
           } catch (err) {
             item.status = "error";
             item.error = err instanceof Error ? err.message : String(err);
           }
         } else {
-          await runItem(ctx, def, item, context);
+          await runItem(ctx, def, item, context, undefined, mailbox);
         }
       }
     });
@@ -233,17 +298,29 @@ export default function swarm(pi: ExtensionAPI) {
       "read-only scout; set agent to force one type for all items. context is prepended to every item. " +
       "Blocking by default (returns the aggregated report); background=true returns a runId for swarm_status. " +
       "Write each item as a self-contained brief — children see nothing else. For MUTATING items set " +
-      "isolation=worktree: each item gets its own git worktree and branch; reports say how to merge.",
+      "isolation=worktree: each item gets its own git worktree and branch; reports say how to merge. " +
+      "mailbox=true adds swarm_post/swarm_inbox so agents can warn each other about shared files and " +
+      "conventions instead of silently conflicting.",
     parameters: Type.Object({
       items: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_ITEMS }),
       context: Type.Optional(Type.String({ description: "Shared preamble for every item" })),
       agent: Type.Optional(Type.String({ description: "Force one agent type for all items" })),
       isolation: Type.Optional(Type.String({ description: "Set to worktree to give each item its own git worktree (for mutating items)" })),
+      mailbox: Type.Optional(
+        Type.Boolean({ description: "Give the agents swarm_post/swarm_inbox to share facts mid-run" }),
+      ),
       background: Type.Optional(Type.Boolean()),
     }),
     async execute(
       _id,
-      params: { items: string[]; context?: string; agent?: string; background?: boolean; isolation?: string },
+      params: {
+        items: string[];
+        context?: string;
+        agent?: string;
+        background?: boolean;
+        isolation?: string;
+        mailbox?: boolean;
+      },
       _signal,
       _onUpdate,
       ctx,
@@ -281,7 +358,7 @@ export default function swarm(pi: ExtensionAPI) {
       renderWidget(uiCtx);
 
       if (run.background) {
-        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree").then(() => {
+        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true).then(() => {
           notify(uiCtx, `swarm ${run.runId} finished — collect with swarm_status`, "info");
         });
         return {
@@ -292,7 +369,7 @@ export default function swarm(pi: ExtensionAPI) {
         };
       }
 
-      await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree");
+      await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true);
       return {
         content: [{ type: "text", text: buildReport(run) }],
         details: { runId: run.runId },

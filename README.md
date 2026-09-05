@@ -27,6 +27,15 @@ match_keywords: rust, memory safety
 
 `@pify/subagent` = one child, one task. `@pify/swarm` = many independent items at once. `@pify/workflow` = deterministic scripted orchestration. Pick the smallest one that fits.
 
+## Mailbox (v0.3)
+
+`swarm_run(items, { mailbox: true })` gives every agent two extra tools:
+
+- `swarm_post(message)` — tell the siblings something that changes their work: a shared file you modified, a convention you had to pick, a blocker they will hit too.
+- `swarm_inbox()` — read what the others posted since your last check.
+
+Without it, parallel agents cannot see each other, so two of them cheerfully fix the same shared helper in two different ways. It is deliberately not a chat: no addressing, no waiting, no replies — an append-only log per run, and an agent never sees its own posts echoed back. A torn line from two simultaneous appends is skipped rather than failing the read.
+
 ## License
 
 MIT © [Pify maintainers](https://github.com/pifydev)

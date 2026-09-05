@@ -1,6 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseAgentFile } from "../src/frontmatter.ts";
+import {
+  MAX_MESSAGE_CHARS,
+  formatInbox,
+  mailboxDir,
+  mailboxPrompt,
+  postMessage,
+  readInbox,
+  readMailbox,
+} from "../src/mailbox.ts";
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { globToRegex, pathTokens, routeItem } from "../src/routing.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
@@ -133,4 +145,60 @@ test("widget renders items with icons; stale run hides", () => {
 
   assert.deepEqual(buildWidgetLines(run([item({})]), theme, 100_000), []);
   assert.deepEqual(buildWidgetLines(null, theme, 0), []);
+});
+
+test("v0.3 mailbox: posts are shared, own posts never echo back", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-swarm-mail-"));
+  try {
+    const dir = mailboxDir(base, "run-1");
+    assert.deepEqual(readMailbox(dir), []);
+    assert.equal(formatInbox(readInbox(dir, "worker-1")), "No new messages from the other agents.");
+
+    postMessage(dir, "worker-1", "I renamed src/util.ts to src/utils.ts", 1000);
+    postMessage(dir, "worker-2", "Config keys are snake_case in this repo", 2000);
+
+    const forOne = readInbox(dir, "worker-1");
+    assert.equal(forOne.messages.length, 1);
+    assert.equal(forOne.messages[0]!.from, "worker-2");
+    assert.equal(forOne.nextSeq, 2);
+    assert.ok(formatInbox(forOne).includes("[#2 from worker-2]"));
+
+    // a second read after sinceSeq returns only what is new
+    assert.equal(readInbox(dir, "worker-1", forOne.nextSeq).messages.length, 0);
+    postMessage(dir, "worker-3", "Tests live in test/, not __tests__", 3000);
+    const later = readInbox(dir, "worker-1", forOne.nextSeq);
+    assert.equal(later.messages.length, 1);
+    assert.equal(later.messages[0]!.seq, 3);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("v0.3 mailbox is robust to junk and refuses empty posts", () => {
+  const base = mkdtempSync(join(tmpdir(), "pify-swarm-mail2-"));
+  try {
+    const dir = mailboxDir(base, "run/../weird id");
+    assert.ok(!dir.includes(".."));
+    postMessage(dir, "a", "first", 1);
+    // a torn/partial line from a concurrent append must not break the read
+    appendFileSync(join(dir, "messages.jsonl"), '{"seq":2,"from":"b","tex\n');
+    postMessage(dir, "b", "second", 2);
+    const all = readMailbox(dir);
+    assert.deepEqual(all.map((m) => m.text), ["first", "second"]);
+
+    assert.throws(() => postMessage(dir, "a", "   ", 3), /cannot be empty/);
+    // long messages are capped, not rejected
+    const long = postMessage(dir, "a", "x".repeat(5000), 4);
+    assert.equal(long.text.length, MAX_MESSAGE_CHARS);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("v0.3 mailboxPrompt names the agent and its discipline", () => {
+  const prompt = mailboxPrompt("worker-2");
+  assert.ok(prompt.includes('"worker-2"'));
+  assert.ok(prompt.includes("swarm_post"));
+  assert.ok(prompt.includes("swarm_inbox"));
+  assert.ok(prompt.includes("not post progress narration") || prompt.includes("Do not post progress"));
 });
