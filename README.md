@@ -39,3 +39,5 @@ Without it, parallel agents cannot see each other, so two of them cheerfully fix
 ## License
 
 MIT © [Pify maintainers](https://github.com/pifydev)
+
+**Isolated runs clean up after themselves** (v0.4): a worktree whose child changed nothing is removed along with its branch — otherwise a read-only step left one of each behind, per run. Anything uncommitted, or any commit the child made, is kept and reported.

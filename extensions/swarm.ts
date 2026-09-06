@@ -25,7 +25,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
-import { createIsolationWorktree, isolationNote } from "../src/isolate.ts";
+import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
@@ -43,6 +43,8 @@ import { readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const RUN_ENTRY = "swarm-run";
+const CLEAN_WORKTREE_NOTE =
+  "Ran isolated in a temporary worktree; it changed nothing, so the worktree was removed.";
 
 type UiContext = ExtensionContext;
 
