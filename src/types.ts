@@ -61,7 +61,11 @@ export interface ItemState {
   error: string | null;
 }
 
-export type RunStatus = "running" | "done";
+/**
+ * "cancelled" is its own outcome, not a completion: someone stopped the run,
+ * and calling it done would report results nobody produced.
+ */
+export type RunStatus = "running" | "done" | "cancelled";
 
 export interface SwarmRun {
   runId: string;

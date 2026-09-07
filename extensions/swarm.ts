@@ -25,6 +25,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
@@ -77,6 +78,8 @@ function loadDefs(cwd: string, agentDir: string): Map<string, AgentDef> {
 export default function swarm(pi: ExtensionAPI) {
   let defs = new Map<string, AgentDef>();
   const runs = new Map<string, SwarmRun>();
+  /** Live child sessions per run, so a stop actually reaches the children. */
+  const live = new LiveChildren();
   let activeRun: SwarmRun | null = null;
   let runCounter = 0;
   let lastUiCtx: UiContext | null = null;
@@ -86,7 +89,7 @@ export default function swarm(pi: ExtensionAPI) {
     lastUiCtx = ctx;
     const run = activeRun;
     const now = Date.now();
-    if (!run || (run.status === "done" && (run.finishedAt ?? 0) < now - 15_000)) {
+    if (!run || (run.status !== "running" && (run.finishedAt ?? 0) < now - 15_000)) {
       ctx.ui.setWidget("swarm", undefined);
       return;
     }
@@ -151,6 +154,7 @@ export default function swarm(pi: ExtensionAPI) {
 
   async function runItem(
     ctx: UiContext,
+    runId: string,
     def: AgentDef,
     item: ItemState,
     context: string,
@@ -161,6 +165,7 @@ export default function swarm(pi: ExtensionAPI) {
     renderWidget();
     let session: AgentSession | null = null;
     let unsubscribe: (() => void) | null = null;
+    let releaseLive: (() => void) | null = null;
     try {
       let model = ctx.model ?? null;
       if (def.model) {
@@ -198,6 +203,7 @@ export default function swarm(pi: ExtensionAPI) {
         }),
       });
       session = created.session;
+      releaseLive = live.register(runId, session);
 
       unsubscribe = session.subscribe((event) => {
         if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
@@ -232,6 +238,7 @@ export default function swarm(pi: ExtensionAPI) {
       item.status = "error";
       item.error = err instanceof Error ? err.message : String(err);
     } finally {
+      if (releaseLive) releaseLive();
       if (unsubscribe) {
         try {
           unsubscribe();
@@ -264,6 +271,9 @@ export default function swarm(pi: ExtensionAPI) {
     const queue = [...run.items];
     const workers = Array.from({ length: Math.min(DEFAULT_CONCURRENCY, queue.length) }, async () => {
       for (;;) {
+        // A cancelled run stops taking new items; the ones already in flight
+        // were aborted by cancelRun.
+        if (run.status === "cancelled") return;
         const item = queue.shift();
         if (!item) return;
         const def = routeItem(item.item, defs, fixed);
@@ -271,21 +281,40 @@ export default function swarm(pi: ExtensionAPI) {
         if (isolate) {
           try {
             const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
-            await runItem(ctx, def, item, context, iso.path, mailbox);
+            await runItem(ctx, run.runId, def, item, context, iso.path, mailbox);
             if (item.result !== null) item.result = `${item.result}\n\n${isolationNote(iso)}`;
           } catch (err) {
             item.status = "error";
             item.error = err instanceof Error ? err.message : String(err);
           }
         } else {
-          await runItem(ctx, def, item, context, undefined, mailbox);
+          await runItem(ctx, run.runId, def, item, context, undefined, mailbox);
         }
       }
     });
     await Promise.all(workers);
-    run.status = "done";
+    if (run.status !== "cancelled") run.status = "done";
     run.finishedAt = Date.now();
     pi.appendEntry(RUN_ENTRY, run);
+    renderWidget();
+  }
+
+  /**
+   * Stop a run and every child it started. Both meanings of "stop" — the
+   * user's abort and session teardown — come through here.
+   */
+  function cancelRun(run: SwarmRun, reason: CancelReason): void {
+    const stopped = live.abortRun(run.runId);
+    if (run.status === "running") {
+      run.status = "cancelled";
+      run.finishedAt = Date.now();
+    }
+    for (const item of run.items) {
+      if (item.status === "running" || item.status === "queued") {
+        item.status = "aborted";
+        item.error = cancelNote(reason, stopped);
+      }
+    }
     renderWidget();
   }
 
@@ -323,7 +352,7 @@ export default function swarm(pi: ExtensionAPI) {
         isolation?: string;
         mailbox?: boolean;
       },
-      _signal,
+      signal,
       _onUpdate,
       ctx,
     ) {
@@ -359,6 +388,18 @@ export default function swarm(pi: ExtensionAPI) {
       activeRun = run;
       renderWidget(uiCtx);
 
+      // Esc must reach the children. A background run outlives this tool call
+      // by design, so its signal is not its cancel button.
+      let stopListening: (() => void) | null = null;
+      if (signal && !run.background) {
+        const onAbort = () => cancelRun(run, "user-abort");
+        if (signal.aborted) onAbort();
+        else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          stopListening = () => signal.removeEventListener("abort", onAbort);
+        }
+      }
+
       if (run.background) {
         void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true).then(() => {
           notify(uiCtx, `swarm ${run.runId} finished — collect with swarm_status`, "info");
@@ -371,7 +412,11 @@ export default function swarm(pi: ExtensionAPI) {
         };
       }
 
-      await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true);
+      try {
+        await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true);
+      } finally {
+        if (stopListening) stopListening();
+      }
       return {
         content: [{ type: "text", text: buildReport(run) }],
         details: { runId: run.runId },
@@ -389,7 +434,13 @@ export default function swarm(pi: ExtensionAPI) {
     async execute(_id, params: { runId?: string }) {
       const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
       if (!run) throw new Error("No swarm runs this session.");
-      const text = run.status === "done" ? buildReport(run) : buildStatusLine(run);
+      const text =
+        run.status === "cancelled"
+          ? "This run was cancelled before it finished. Below is what the items that did complete produced.\n" +
+            buildReport(run)
+          : run.status === "done"
+            ? buildReport(run)
+            : buildStatusLine(run);
       return { content: [{ type: "text", text }], details: { runId: run.runId, status: run.status } };
     },
   });
@@ -404,7 +455,7 @@ export default function swarm(pi: ExtensionAPI) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e.type !== "custom" || e.customType !== RUN_ENTRY || !isRecord(e.data)) continue;
       const run = e.data as unknown as SwarmRun;
-      if (typeof run.runId === "string" && run.status === "done") {
+      if (typeof run.runId === "string" && run.status !== "running") {
         runs.set(run.runId, run);
         const n = Number.parseInt(run.runId.slice(1), 10);
         if (Number.isFinite(n) && n > runCounter) runCounter = n;
@@ -414,6 +465,10 @@ export default function swarm(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // A run cannot outlive the session that owns it.
+    for (const run of runs.values()) {
+      if (run.status === "running") cancelRun(run, "session-switch");
+    }
     if (ctx.hasUI) ctx.ui.setWidget("swarm", undefined);
   });
 
