@@ -65,6 +65,10 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 - **Stopping stops the children.** Pressing Esc, or switching away from the session, aborts every live child rather than leaving them talking to the provider on your money. A cancelled run keeps that verdict — it is never reported as done — and `swarm_status` shows what the items that did finish produced.
 - **Isolated runs clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; otherwise a read-only step left one of each behind on every run. Anything uncommitted, and any commit the child made, is kept and reported.
 
+## A background run comes back to you
+
+`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. Now the aggregated report is **delivered** into the conversation when the run finishes, and asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
+
 ## Command
 
 `/swarm` — runs in this session, and the agent types available for routing.

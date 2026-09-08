@@ -26,6 +26,7 @@ import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
+import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
@@ -402,7 +403,22 @@ export default function swarm(pi: ExtensionAPI) {
 
       if (run.background) {
         void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true).then(() => {
-          notify(uiCtx, `swarm ${run.runId} finished — collect with swarm_status`, "info");
+          notify(uiCtx, `swarm ${run.runId} finished`, "info");
+          // The report goes to the agent, not only to the screen — otherwise
+          // asking again was its only way to find out.
+          try {
+            pi.sendMessage(
+              {
+                customType: DELIVERY_TYPE,
+                content: deliveryMessage(run.runId, "swarm", buildReport(run)),
+                display: true,
+                details: { runId: run.runId, status: run.status, items: run.items.length },
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          } catch {
+            // Delivery is a convenience; swarm_status still works.
+          }
         });
         return {
           content: [
@@ -434,6 +450,16 @@ export default function swarm(pi: ExtensionAPI) {
     async execute(_id, params: { runId?: string }) {
       const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
       if (!run) throw new Error("No swarm runs this session.");
+      if (run.status === "running") {
+        const pending = pendingResult({
+          id: run.runId,
+          kind: "running",
+          startedAt: run.startedAt,
+          now: Date.now(),
+          collectWith: "swarm_status",
+        });
+        return { content: [{ type: "text", text: pending.text }], details: pending.details as never };
+      }
       const text =
         run.status === "cancelled"
           ? "This run was cancelled before it finished. Below is what the items that did complete produced.\n" +
