@@ -1,6 +1,6 @@
 ---
 name: swarm
-description: Use when work splits into several independent items that can run in parallel - multi-file reviews, sweeps, parallel research - explains swarm_run fan-out, auto-routing, and how to slice items well
+description: Use when work splits into several independent items that can run in parallel - multi-file reviews, sweeps, parallel research
 ---
 
 # Swarm
