@@ -332,6 +332,7 @@ export default function swarm(pi: ExtensionAPI) {
   pi.registerTool({
     name: "swarm_run",
     label: "Run swarm",
+    promptSnippet: "Run many independent items through child agents at once",
     description:
       `Fan out 1-${MAX_ITEMS} independent task items to parallel child agents (concurrency ${DEFAULT_CONCURRENCY}). ` +
       "Each item auto-routes to an agent type via its match_patterns/match_keywords, falling back to the " +
@@ -451,6 +452,7 @@ export default function swarm(pi: ExtensionAPI) {
   pi.registerTool({
     name: "swarm_status",
     label: "Swarm status",
+    promptSnippet: "Progress of a running swarm",
     description: "Progress of a swarm run (default: the latest). Returns the full report when finished.",
     parameters: Type.Object({
       runId: Type.Optional(Type.String()),
