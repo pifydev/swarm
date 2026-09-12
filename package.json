@@ -1,6 +1,6 @@
 {
   "name": "@pify/swarm",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Coordinate multiple pi agents in parallel: swarm_run fan-out with per-item auto-routing, concurrency queue, aggregated reports",
   "keywords": [
     "pi-package",

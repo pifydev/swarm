@@ -25,6 +25,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { withUiLock } from "../src/ui-lock.ts";
 import {
   consentQuestion,
   decideConsent,
@@ -542,9 +543,11 @@ export default function swarm(pi: ExtensionAPI) {
     });
     if (verdict !== "ask") return verdict === "allow";
 
-    const approved = await ctx.ui.confirm(
-      "Load this project's agent definitions?",
-      consentQuestion("its own agent definitions, which override the builtins of the same name", dir),
+    const approved = await withUiLock(() =>
+      ctx.ui.confirm(
+        "Load this project's agent definitions?",
+        consentQuestion("its own agent definitions, which override the builtins of the same name", dir),
+      ),
     );
     try {
       writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "agents", approved), null, 2)}
