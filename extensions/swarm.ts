@@ -182,26 +182,34 @@ export default function swarm(pi: ExtensionAPI) {
       };
       const promptOptions = promptHost.getSystemPromptOptions?.() ?? {};
 
+      // `reload()` is not optional. `createAgentSession` only loads a resource
+      // loader it builds itself; one passed in is used exactly as handed over,
+      // and a fresh DefaultResourceLoader resolves neither `systemPrompt` nor
+      // `appendSystemPrompt` until it loads. Without it the child ran with no
+      // instructions at all — the call succeeds, the model answers, and it
+      // answers as a generic assistant with nothing to say it went wrong.
+      const loader = new DefaultResourceLoader({
+        cwd: workDir ?? ctx.cwd,
+        agentDir: getAgentDir(),
+        noExtensions: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        systemPrompt: promptOptions.customPrompt,
+        appendSystemPrompt: [
+          ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
+          def.systemPrompt,
+          "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — make it complete and self-contained.",
+          ...(mailbox ? [mailboxPrompt(item.agent + "-" + item.index)] : []),
+        ],
+      });
+      await loader.reload();
       const created = await createAgentSession({
         sessionManager: SessionManager.inMemory(workDir ?? ctx.cwd),
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
         tools: def.tools,
         ...(mailbox ? { customTools: mailboxTools(mailbox, item.agent + "-" + item.index) } : {}),
-        resourceLoader: new DefaultResourceLoader({
-          cwd: workDir ?? ctx.cwd,
-          agentDir: getAgentDir(),
-          noExtensions: true,
-          noPromptTemplates: true,
-          noThemes: true,
-          systemPrompt: promptOptions.customPrompt,
-          appendSystemPrompt: [
-            ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
-            def.systemPrompt,
-            "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — make it complete and self-contained.",
-            ...(mailbox ? [mailboxPrompt(item.agent + "-" + item.index)] : []),
-          ],
-        }),
+        resourceLoader: loader,
       });
       session = created.session;
       releaseLive = live.register(runId, session);
