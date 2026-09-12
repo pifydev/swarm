@@ -1,3 +1,4 @@
+import { clampRows, clampWidth, MAX_WIDGET_ROWS } from "./widget-clamp.ts";
 import type { SwarmRun, ThemeLike } from "./types.ts";
 
 const WIDTH = 54;
@@ -29,7 +30,9 @@ export function buildWidgetLines(run: SwarmRun | null, theme: ThemeLike, now: nu
   const pad = Math.max(1, WIDTH - title.length - hint.length);
   lines.push(dim(`╭${title}${"─".repeat(pad)}${hint}╮`));
 
-  for (const item of run.items) {
+  // Cap the rows: a large swarm would otherwise push the editor off screen,
+  // since a Text-factory widget bypasses pi's ten-line guard.
+  const rows = run.items.map((item) => {
     const paint =
       item.status === "running"
         ? (s: string) => theme.fg("warning", s)
@@ -38,8 +41,10 @@ export function buildWidgetLines(run: SwarmRun | null, theme: ThemeLike, now: nu
           : item.status === "queued"
             ? dim
             : (s: string) => theme.fg("error", s);
-    const text = item.item.length > 32 ? `${item.item.slice(0, 32)}…` : item.item;
-    lines.push(`${dim("│ ")}${paint(`${icon(item.status)} ${item.agent}`)}${dim(` ${text}`)}`);
+    return `${dim("│ ")}${paint(`${icon(item.status)} ${clampWidth(item.agent, 24)}`)}${dim(` ${clampWidth(item.item, 32)}`)}`;
+  });
+  for (const row of clampRows(rows, MAX_WIDGET_ROWS, (hidden) => dim(`│ … +${hidden} more`))) {
+    lines.push(row);
   }
 
   lines.push(dim(`╰${"─".repeat(WIDTH)}╯`));
