@@ -67,7 +67,7 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 
 ## A background run comes back to you
 
-`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. The aggregated report is *sent* into the conversation when the run finishes — honestly: this delivery mechanism is the same one whose only live measurement in the suite (subagent's) currently fails under print mode's teardown, and swarm has no live test of its own yet, so treat delivery as unmeasured and `swarm_status` as the reliable path. Asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
+`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. The aggregated report is **delivered** into the conversation when the run finishes — measured, not assumed: `test/live/delivery-wire.mjs` drives a real background swarm through pi, holds the session open the way an interactive one naturally stays open, and reads the report out of pi's own provider payload (3/3; the run finished and the report arrived unasked). One caveat the measurement taught: delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not. Asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
 
 ## Command
 
