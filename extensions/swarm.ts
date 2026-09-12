@@ -25,6 +25,14 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import {
+  consentQuestion,
+  decideConsent,
+  envConsent,
+  parseConsent,
+  readConsent,
+  writeConsent,
+} from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
@@ -41,7 +49,7 @@ import {
   type ItemState,
   type SwarmRun,
 } from "../src/types.ts";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const RUN_ENTRY = "swarm-run";
@@ -50,16 +58,23 @@ const CLEAN_WORKTREE_NOTE =
 
 type UiContext = ExtensionContext;
 
-function loadDefs(cwd: string, agentDir: string): Map<string, AgentDef> {
+function loadDefs(cwd: string, agentDir: string, projectAllowed: boolean): Map<string, AgentDef> {
   const defs = new Map<string, AgentDef>();
   for (const [name, content] of Object.entries(BUILTIN_AGENTS)) {
     const def = parseAgentFile(name, content, "builtin");
     if (def) defs.set(def.name, def);
   }
-  for (const [dir, source] of [
-    [join(agentDir, "agents"), "global"],
-    [join(cwd, ".pi", "agents"), "project"],
-  ] as const) {
+  // The project directory is consent-gated: `.pi/agents/*.md` is repo-shipped
+  // text that becomes a CHILD SYSTEM PROMPT, overriding builtins of the same
+  // name, and pi never asks about it — measured, a repo whose only pi file is
+  // `.pi/agents/reviewer.md` reports isProjectTrusted=true. One answer,
+  // recorded under the same "agents" scope subagent uses, governs the catalog
+  // across the whole suite.
+  const sources: Array<readonly [string, "global" | "project"]> = [
+    [join(agentDir, "agents"), "global"] as const,
+    ...(projectAllowed ? [[join(cwd, ".pi", "agents"), "project"] as const] : []),
+  ];
+  for (const [dir, source] of sources) {
     try {
       for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
         try {
@@ -243,6 +258,15 @@ export default function swarm(pi: ExtensionAPI) {
       item.status =
         last?.stopReason === "aborted" ? "aborted" : last?.stopReason === "error" ? "error" : "done";
       if (item.status === "error") item.error = text || "child session error";
+      // A child that stopped cleanly and said nothing has not answered — the
+      // fix subagent already carries and this executor never received. Left
+      // as "done", a reasoning-only finish (measured on anthropic/claude-opus-5
+      // through child sessions) rendered a successful fan-out of "(empty
+      // report)" items. An exit status is not an answer.
+      if (item.status === "done" && !item.result) {
+        item.status = "error";
+        item.error = "the child finished without producing an answer";
+      }
     } catch (err) {
       item.status = "error";
       item.error = err instanceof Error ? err.message : String(err);
@@ -411,11 +435,11 @@ export default function swarm(pi: ExtensionAPI) {
       }
 
       if (run.background) {
-        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true).then(() => {
-          notify(uiCtx, `swarm ${run.runId} finished`, "info");
-          // The report goes to the agent, not only to the screen — otherwise
-          // asking again was its only way to find out.
-          try {
+        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true)
+          .then(() => {
+            notify(uiCtx, `swarm ${run.runId} finished`, "info");
+            // The report goes to the agent, not only to the screen — otherwise
+            // asking again was its only way to find out.
             pi.sendMessage(
               {
                 customType: DELIVERY_TYPE,
@@ -425,10 +449,15 @@ export default function swarm(pi: ExtensionAPI) {
               },
               { deliverAs: "followUp", triggerTurn: true },
             );
-          } catch {
-            // Delivery is a convenience; swarm_status still works.
-          }
-        });
+          })
+          .catch(() => {
+            // The whole chain, not just sendMessage: a /reload or session
+            // switch while the run is in flight makes every captured pi/ctx
+            // handle throw "ctx is stale" on next use, and an uncaught
+            // rejection here takes the entire process down with it — the run's
+            // work lost to a notification. Delivery is a convenience;
+            // swarm_status still works.
+          });
         return {
           content: [
             { type: "text", text: `Swarm ${run.runId} started (${items.length} items). Poll swarm_status runId="${run.runId}".` },
@@ -483,8 +512,51 @@ export default function swarm(pi: ExtensionAPI) {
 
   // ── Lifecycle & command ──────────────────────────────────────────────
 
+  /** Where the suite records which projects you approved, and for what. */
+  function consentFile(): string {
+    return join(getAgentDir(), "pify-project-consent.json");
+  }
+
+  /**
+   * May this repository's own agent definitions load? Same question, same
+   * store, and the same "agents" scope subagent records — one answer governs
+   * the catalog across subagent, swarm and workflow, so approving or refusing
+   * once means the same thing everywhere.
+   */
+  async function projectAgentsAllowed(ctx: ExtensionContext): Promise<boolean> {
+    const dir = join(ctx.cwd, ".pi", "agents");
+    if (!existsSync(dir)) return false;
+    const file = consentFile();
+    let raw: string | null = null;
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch {
+      raw = null;
+    }
+    const store = parseConsent(raw);
+    const verdict = decideConsent({
+      projectTrusted: (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? false,
+      remembered: readConsent(store, ctx.cwd, "agents"),
+      hasUI: ctx.hasUI,
+      envOverride: envConsent(process.env),
+    });
+    if (verdict !== "ask") return verdict === "allow";
+
+    const approved = await ctx.ui.confirm(
+      "Load this project's agent definitions?",
+      consentQuestion("its own agent definitions, which override the builtins of the same name", dir),
+    );
+    try {
+      writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "agents", approved), null, 2)}
+`);
+    } catch {
+      // An unwritable consent file costs us the memory of the answer, not the answer.
+    }
+    return approved;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
-    defs = loadDefs(ctx.cwd, getAgentDir());
+    defs = loadDefs(ctx.cwd, getAgentDir(), await projectAgentsAllowed(ctx));
     runs.clear();
     activeRun = null;
     for (const entry of ctx.sessionManager.getBranch()) {

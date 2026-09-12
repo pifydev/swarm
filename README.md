@@ -57,7 +57,7 @@ match_keywords: rust, memory safety
 
 `match_patterns` are globs matched against path-like tokens in the item — the longest match wins, so a specific rule beats a general one. `match_keywords` match the item's words. `review src/auth.rs` routes to the Rust auditor; `test the login flow` to a tester; anything matching nothing falls back to the read-only `scout`, so **the fallback can never mutate**.
 
-The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.com/pifydev/subagent) reads — `description`, `tools`, `model`, `thinking`, `max_turns` — plus the two routing keys. Project-local definitions load only once pi's project trust has been granted.
+The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.com/pifydev/subagent) reads — `description`, `tools`, `model`, `thinking`, `max_turns` — plus the two routing keys. Project-local definitions load only after you approve them — once per project, remembered in `pify-project-consent.json`, the same "agents" answer [`@pify/subagent`](https://github.com/pifydev/subagent) records, so approving or refusing once means the same thing across the suite. pi's own project trust is necessary but not sufficient here: pi only asks about trust when a repo ships something pi itself loads, and `.pi/agents/` is not on that list — measured, a repo whose only pi file is `.pi/agents/reviewer.md` reports `isProjectTrusted=true`. For CI, `PIFY_TRUST_PROJECT=1`. (Earlier versions of this paragraph claimed the gate existed before it did; as of v0.7.0 it does.)
 
 ## Behaviour
 
@@ -67,7 +67,7 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 
 ## A background run comes back to you
 
-`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. Now the aggregated report is **delivered** into the conversation when the run finishes, and asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
+`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. The aggregated report is *sent* into the conversation when the run finishes — honestly: this delivery mechanism is the same one whose only live measurement in the suite (subagent's) currently fails under print mode's teardown, and swarm has no live test of its own yet, so treat delivery as unmeasured and `swarm_status` as the reliable path. Asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
 
 ## Command
 
