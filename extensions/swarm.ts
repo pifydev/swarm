@@ -316,7 +316,15 @@ export default function swarm(pi: ExtensionAPI) {
           try {
             const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
             await runItem(ctx, run.runId, def, item, context, iso.path, mailbox);
-            if (item.result !== null) item.result = `${item.result}\n\n${isolationNote(iso)}`;
+            // Remove the worktree when the item changed nothing — the cleanup
+            // the README promised but the code never performed (removeIfUnchanged
+            // was imported and never called, leaking a worktree + branch per
+            // read-only item). Kept when there is work to merge, and only then
+            // is the merge note worth showing.
+            const removed = removeIfUnchanged(ctx.cwd, iso);
+            if (item.result !== null) {
+              item.result = `${item.result}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(iso)}`;
+            }
           } catch (err) {
             item.status = "error";
             item.error = err instanceof Error ? err.message : String(err);
