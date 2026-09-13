@@ -1,5 +1,7 @@
 # @pify/swarm
 
+[![npm version](https://img.shields.io/npm/v/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm) [![npm downloads](https://img.shields.io/npm/dm/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm)
+
 Run many [pi](https://github.com/earendil-works/pi) agents in parallel. One tool call fans a list of independent items out to child agents — with per-item routing, a concurrency queue, a live widget, and one aggregated report.
 
 Part of the [Pify suite](https://github.com/pifydev). Install with [`pify install swarm`](https://github.com/pifydev/cli) or `pi install npm:@pify/swarm`.
