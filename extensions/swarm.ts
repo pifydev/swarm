@@ -26,6 +26,7 @@ import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { withUiLock } from "../src/ui-lock.ts";
+import { LoopGuard } from "../src/loop-guard.ts";
 import {
   consentQuestion,
   decideConsent,
@@ -183,6 +184,7 @@ export default function swarm(pi: ExtensionAPI) {
     let session: AgentSession | null = null;
     let unsubscribe: (() => void) | null = null;
     let releaseLive: (() => void) | null = null;
+    let stallReason: string | null = null;
     try {
       let model = ctx.model ?? null;
       if (def.model) {
@@ -230,11 +232,37 @@ export default function swarm(pi: ExtensionAPI) {
       session = created.session;
       releaseLive = live.register(runId, session);
 
+      const guard = new LoopGuard();
       unsubscribe = session.subscribe((event) => {
-        if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
+        const message = (
+          event as {
+            message?: {
+              role?: string;
+              usage?: { totalTokens?: number };
+              content?: Array<{ type?: string; text?: string }>;
+            };
+          }
+        ).message;
+        if (event.type === "message_end" && message?.role === "assistant") {
           item.turns++;
-          const usage = (event as { message?: { usage?: { totalTokens?: number } } }).message?.usage;
+          const usage = message.usage;
           if (usage && typeof usage.totalTokens === "number") item.tokens += usage.totalTokens;
+
+          // Stop an item that is spinning — restating itself without acting —
+          // rather than letting it run to the turn cap. See loop-guard.ts.
+          if (!stallReason && Array.isArray(message.content)) {
+            const usedTool = message.content.some((c) => c.type === "toolCall");
+            const turnText = message.content
+              .filter((c) => c.type === "text" && typeof c.text === "string")
+              .map((c) => c.text)
+              .join("\n");
+            const verdict = guard.observe({ text: turnText, usedTool });
+            if (verdict.stalled) {
+              stallReason = verdict.reason ?? "no progress";
+              void session?.abort().catch(() => {});
+            }
+          }
+
           renderWidget();
           if (item.turns >= def.maxTurns) void session?.abort().catch(() => {});
         }
@@ -255,9 +283,18 @@ export default function swarm(pi: ExtensionAPI) {
         .join("\n")
         .trim();
 
-      item.result = text || null;
-      item.status =
-        last?.stopReason === "aborted" ? "aborted" : last?.stopReason === "error" ? "error" : "done";
+      // An item the loop guard stopped gave up rather than concluded — mark it
+      // so the aggregated report does not read it as a finished answer.
+      item.result = stallReason
+        ? `${text ? `${text}\n\n` : ""}[stopped: no progress — the agent ${stallReason}]`
+        : text || null;
+      item.status = stallReason
+        ? "aborted"
+        : last?.stopReason === "aborted"
+          ? "aborted"
+          : last?.stopReason === "error"
+            ? "error"
+            : "done";
       if (item.status === "error") item.error = text || "child session error";
       // A child that stopped cleanly and said nothing has not answered — the
       // fix subagent already carries and this executor never received. Left
