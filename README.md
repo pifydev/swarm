@@ -1,6 +1,6 @@
 # @pify/swarm
 
-[![npm version](https://img.shields.io/npm/v/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm) [![npm downloads](https://img.shields.io/npm/dm/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm)
+[![CI](https://github.com/pifydev/swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/pifydev/swarm/actions/workflows/ci.yml) [![npm version](https://img.shields.io/npm/v/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm) [![npm downloads](https://img.shields.io/npm/dm/@pify/swarm)](https://www.npmjs.com/package/@pify/swarm)
 
 Run many [pi](https://github.com/earendil-works/pi) agents in parallel. One tool call fans a list of independent items out to child agents — with per-item routing, a concurrency queue, a live widget, and one aggregated report.
 
