@@ -42,6 +42,8 @@ import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
 import { routeItem } from "../src/routing.ts";
+import { normalizeItems } from "../src/graph.ts";
+import { runGraph } from "../src/schedule.ts";
 import { buildWidgetLines } from "../src/widget.ts";
 import {
   DEFAULT_CONCURRENCY,
@@ -328,7 +330,11 @@ export default function swarm(pi: ExtensionAPI) {
     }
   }
 
-  /** Pool executor: at most DEFAULT_CONCURRENCY items in flight. */
+  /**
+   * Readiness scheduler: run each item as soon as its `needs` are done, up to
+   * DEFAULT_CONCURRENCY at once. A flat run (no needs anywhere) makes every
+   * item ready immediately, so this is identical to the old parallel pool.
+   */
   async function executeRun(
     ctx: UiContext,
     run: SwarmRun,
@@ -339,25 +345,33 @@ export default function swarm(pi: ExtensionAPI) {
   ): Promise<void> {
     // One shared log per run; only created when the caller asked for it.
     const mailbox = useMailbox ? mailboxDir(getAgentDir(), run.runId) : undefined;
-    const queue = [...run.items];
-    const workers = Array.from({ length: Math.min(DEFAULT_CONCURRENCY, queue.length) }, async () => {
-      for (;;) {
-        // A cancelled run stops taking new items; the ones already in flight
-        // were aborted by cancelRun.
-        if (run.status === "cancelled") return;
-        const item = queue.shift();
-        if (!item) return;
+
+    // A dependent structurally receives each upstream's output — the thing a
+    // hand-sequenced coordinator forgets. Prepended to the shared preamble.
+    const contextFor = (upstream: ItemState[]): string => {
+      if (upstream.length === 0) return context;
+      const blocks = upstream.map((up) => {
+        const body = up.result ?? (up.error ? `(failed: ${up.error})` : "(no output)");
+        return `## Output of ${up.id}\n${body}`;
+      });
+      return [context, ...blocks].filter((s) => s && s.trim()).join("\n\n");
+    };
+
+    // Run each item once its needs finish, up to the concurrency cap; a flat
+    // run (no needs) has everything ready at once, exactly like the old pool.
+    await runGraph(
+      run.items,
+      DEFAULT_CONCURRENCY,
+      async (item, upstream) => {
         const def = routeItem(item.item, defs, fixed);
         item.agent = def.name;
+        const itemContext = contextFor(upstream);
         if (isolate) {
           try {
             const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
-            await runItem(ctx, run.runId, def, item, context, iso.path, mailbox);
-            // Remove the worktree when the item changed nothing — the cleanup
-            // the README promised but the code never performed (removeIfUnchanged
-            // was imported and never called, leaking a worktree + branch per
-            // read-only item). Kept when there is work to merge, and only then
-            // is the merge note worth showing.
+            await runItem(ctx, run.runId, def, item, itemContext, iso.path, mailbox);
+            // Remove the worktree when the item changed nothing (the leak
+            // removeIfUnchanged fixes); keep it when there is work to merge.
             const removed = removeIfUnchanged(ctx.cwd, iso);
             if (item.result !== null) {
               item.result = `${item.result}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(iso)}`;
@@ -367,11 +381,12 @@ export default function swarm(pi: ExtensionAPI) {
             item.error = err instanceof Error ? err.message : String(err);
           }
         } else {
-          await runItem(ctx, run.runId, def, item, context, undefined, mailbox);
+          await runItem(ctx, run.runId, def, item, itemContext, undefined, mailbox);
         }
-      }
-    });
-    await Promise.all(workers);
+      },
+      () => run.status === "cancelled",
+    );
+
     if (run.status !== "cancelled") run.status = "done";
     run.finishedAt = Date.now();
     pi.appendEntry(RUN_ENTRY, run);
@@ -411,9 +426,24 @@ export default function swarm(pi: ExtensionAPI) {
       "Write each item as a self-contained brief — children see nothing else. For MUTATING items set " +
       "isolation=worktree: each item gets its own git worktree and branch; reports say how to merge. " +
       "mailbox=true adds swarm_post/swarm_inbox so agents can warn each other about shared files and " +
-      "conventions instead of silently conflicting.",
+      "conventions instead of silently conflicting. " +
+      "An item can be a plain string (independent) OR an object {task, id, needs:[ids]} to declare a " +
+      "dependency: a needed item's output is prepended to the dependent automatically, and the dependent " +
+      "starts only once its needs finish. A cycle, a self-edge, or an unknown id is rejected before anything runs.",
     parameters: Type.Object({
-      items: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_ITEMS }),
+      items: Type.Array(
+        Type.Union([
+          Type.String({ description: "A self-contained task brief (independent item)" }),
+          Type.Object({
+            task: Type.String({ description: "A self-contained task brief" }),
+            id: Type.Optional(Type.String({ description: "Stable id other items can reference in needs (default t1, t2, …)" })),
+            needs: Type.Optional(
+              Type.Array(Type.String(), { description: "Ids of items that must finish first; their output is prepended to this item" }),
+            ),
+          }),
+        ]),
+        { minItems: 1, maxItems: MAX_ITEMS },
+      ),
       context: Type.Optional(Type.String({ description: "Shared preamble for every item" })),
       agent: Type.Optional(Type.String({ description: "Force one agent type for all items" })),
       isolation: Type.Optional(Type.String({ description: "Set to worktree to give each item its own git worktree (for mutating items)" })),
@@ -425,7 +455,7 @@ export default function swarm(pi: ExtensionAPI) {
     async execute(
       _id,
       params: {
-        items: string[];
+        items: Array<string | { task: string; id?: string; needs?: string[] }>;
         context?: string;
         agent?: string;
         background?: boolean;
@@ -437,8 +467,11 @@ export default function swarm(pi: ExtensionAPI) {
       ctx,
     ) {
       const uiCtx = ctx as UiContext;
-      const items = params.items.map((s) => s.trim()).filter(Boolean);
-      if (items.length === 0) throw new Error("swarm_run requires at least one non-empty item.");
+      // Normalize strings/objects into graph nodes and reject a bad graph
+      // (cycle, self-edge, unknown or duplicate id) BEFORE spawning anything.
+      const { nodes, error } = normalizeItems(params.items ?? []);
+      if (error) throw new Error(`swarm_run: ${error}`);
+      if (nodes.length === 0) throw new Error("swarm_run requires at least one non-empty item.");
       if (params.agent && !defs.has(params.agent.toLowerCase())) {
         throw new Error(`Unknown agent type "${params.agent}". Available: ${[...defs.keys()].sort().join(", ")}`);
       }
@@ -453,9 +486,11 @@ export default function swarm(pi: ExtensionAPI) {
         status: "running",
         startedAt: Date.now(),
         finishedAt: null,
-        items: items.map((item, index) => ({
+        items: nodes.map((node, index) => ({
           index,
-          item,
+          id: node.id,
+          item: node.task,
+          needs: node.needs,
           agent: params.agent?.toLowerCase() ?? "?",
           status: "queued",
           turns: 0,
@@ -506,7 +541,7 @@ export default function swarm(pi: ExtensionAPI) {
           });
         return {
           content: [
-            { type: "text", text: `Swarm ${run.runId} started (${items.length} items). Poll swarm_status runId="${run.runId}".` },
+            { type: "text", text: `Swarm ${run.runId} started (${run.items.length} items). Poll swarm_status runId="${run.runId}".` },
           ],
           details: { runId: run.runId },
         };

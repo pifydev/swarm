@@ -100,7 +100,9 @@ test("routing: fixed agent overrides everything; unknown fixed falls through", (
 function item(overrides: Partial<ItemState>): ItemState {
   return {
     index: 0,
+    id: "t1",
     item: "review x",
+    needs: [],
     agent: "scout",
     status: "done",
     turns: 2,

@@ -18,7 +18,7 @@ The catch is that "independent" is usually a small lie — the items do not depe
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `items` | string[], 1–12 | One task per item; four run at a time, the rest queue |
+| `items` | array, 1–12 | A plain string per task, or `{task, id, needs}` to declare a dependency |
 | `context` | string, optional | Prepended to every item, so shared constraints are written once |
 | `agent` | string, optional | Force one agent type for all items instead of routing |
 | `isolation` | `"worktree"`, optional | Give each item its own git worktree — use it when items write |
@@ -26,6 +26,24 @@ The catch is that "independent" is usually a small lie — the items do not depe
 | `background` | boolean, optional | Return a `runId` immediately instead of blocking |
 
 Blocking by default: returns `N done, M error` plus a per-item report.
+
+### Dependencies: `needs`
+
+An item can be a plain string (independent, as before) or an object that declares what it depends on:
+
+```json
+{
+  "items": [
+    { "id": "mig",     "task": "write the DB migration for the users table" },
+    { "id": "callers", "task": "update every caller of the old schema", "needs": ["mig"] },
+    { "id": "tests",   "task": "run the suite and fix what broke",       "needs": ["callers"] }
+  ]
+}
+```
+
+An item starts only once its `needs` have finished, and each upstream item's output is prepended to it as a `## Output of <id>` block — so the thing the coordinator used to forget, passing X to the step that needs it, happens by construction. Independent items still run in parallel up to the concurrency cap; a chain runs in order; a diamond joins after both branches. Ids default to `t1`, `t2`, … when you omit them.
+
+The whole graph is checked **before anything spawns**: a cycle, a self-edge, a duplicate id, or a reference to an unknown id is rejected outright, so a bad graph costs nothing. A flat list of strings has no edges and behaves exactly as it always did.
 
 ### `swarm_status`
 
@@ -77,7 +95,7 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 
 ## Where this sits in the suite
 
-[`@pify/subagent`](https://github.com/pifydev/subagent) is one child and one task. `@pify/swarm` is many independent items at once. [`@pify/workflow`](https://github.com/pifydev/workflow) is deterministic scripted orchestration for when the steps genuinely depend on each other. Pick the smallest one that fits.
+[`@pify/subagent`](https://github.com/pifydev/subagent) is one child and one task. `@pify/swarm` is many items at once — independent, or wired together with a declarative `needs` graph (fan-out, chains, joins). [`@pify/workflow`](https://github.com/pifydev/workflow) is for when orchestration needs real control flow — loops, conditionals, retries, fan-out computed at run time — that a static graph can't express. Pick the smallest one that fits.
 
 ## License
 

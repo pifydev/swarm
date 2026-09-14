@@ -52,7 +52,11 @@ export type ItemStatus = "queued" | "running" | "done" | "error" | "aborted";
 
 export interface ItemState {
   index: number;
+  /** Stable id used for dependency references, e.g. "t1" or a caller-given id. */
+  id: string;
   item: string;
+  /** Ids of items that must finish before this one starts (empty = flat). */
+  needs: string[];
   agent: string;
   status: ItemStatus;
   turns: number;
