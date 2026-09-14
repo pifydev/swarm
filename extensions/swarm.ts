@@ -32,8 +32,8 @@ import {
   decideConsent,
   envConsent,
   parseConsent,
+  persistConsent,
   readConsent,
-  writeConsent,
 } from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
@@ -630,8 +630,7 @@ export default function swarm(pi: ExtensionAPI) {
       ),
     );
     try {
-      writeFileSync(file, `${JSON.stringify(writeConsent(store, ctx.cwd, "agents", approved), null, 2)}
-`);
+      persistConsent(file, ctx.cwd, "agents", approved);
     } catch {
       // An unwritable consent file costs us the memory of the answer, not the answer.
     }
