@@ -38,7 +38,17 @@ import {
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
-import { formatInbox, mailboxDir, mailboxPrompt, postMessage, readInbox } from "../src/mailbox.ts";
+import {
+  MAILBOX_INBOX_TOOL,
+  MAILBOX_POST_TOOL,
+  MAILBOX_TOOL_NAMES,
+  formatInbox,
+  mailboxDir,
+  mailboxKey,
+  mailboxPrompt,
+  postMessage,
+  readInbox,
+} from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine } from "../src/report.ts";
 import { routeItem } from "../src/routing.ts";
@@ -53,7 +63,7 @@ import {
   type ItemState,
   type SwarmRun,
 } from "../src/types.ts";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const RUN_ENTRY = "swarm-run";
@@ -136,7 +146,7 @@ export default function swarm(pi: ExtensionAPI) {
     let seen = 0;
     return [
       {
-        name: "swarm_post",
+        name: MAILBOX_POST_TOOL,
         label: "Post to swarm",
         description:
           "Tell the other agents in this swarm something that changes their work: a shared file you " +
@@ -154,7 +164,7 @@ export default function swarm(pi: ExtensionAPI) {
         },
       },
       {
-        name: "swarm_inbox",
+        name: MAILBOX_INBOX_TOOL,
         label: "Read swarm inbox",
         description:
           "Read what the other agents in this swarm have posted since you last checked. Call it " +
@@ -227,7 +237,11 @@ export default function swarm(pi: ExtensionAPI) {
         sessionManager: SessionManager.inMemory(workDir ?? ctx.cwd),
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
-        tools: def.tools,
+        // `tools` is an allowlist and it filters customTools too, so a mailbox
+        // tool that is not named here is registered and then dropped — the
+        // child is told it has no such tool, and mailbox:true does nothing.
+        // Admit them exactly as @pify/subagent admits ask_supervisor.
+        tools: mailbox ? [...def.tools, ...MAILBOX_TOOL_NAMES] : def.tools,
         ...(mailbox ? { customTools: mailboxTools(mailbox, item.agent + "-" + item.index) } : {}),
         resourceLoader: loader,
       });
@@ -343,8 +357,12 @@ export default function swarm(pi: ExtensionAPI) {
     isolate?: boolean,
     useMailbox?: boolean,
   ): Promise<void> {
-    // One shared log per run; only created when the caller asked for it.
-    const mailbox = useMailbox ? mailboxDir(getAgentDir(), run.runId) : undefined;
+    // One shared log per run; only created when the caller asked for it. Keyed
+    // on a per-run token (not the reused "s1" run id), so one run never reads a
+    // previous run's stale messages, and removed at the end so it never leaks.
+    const mailbox = useMailbox
+      ? mailboxDir(getAgentDir(), mailboxKey(run.runId, run.startedAt))
+      : undefined;
 
     // A dependent structurally receives each upstream's output — the thing a
     // hand-sequenced coordinator forgets. Prepended to the shared preamble.
@@ -359,33 +377,45 @@ export default function swarm(pi: ExtensionAPI) {
 
     // Run each item once its needs finish, up to the concurrency cap; a flat
     // run (no needs) has everything ready at once, exactly like the old pool.
-    await runGraph(
-      run.items,
-      DEFAULT_CONCURRENCY,
-      async (item, upstream) => {
-        const def = routeItem(item.item, defs, fixed);
-        item.agent = def.name;
-        const itemContext = contextFor(upstream);
-        if (isolate) {
-          try {
-            const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
-            await runItem(ctx, run.runId, def, item, itemContext, iso.path, mailbox);
-            // Remove the worktree when the item changed nothing (the leak
-            // removeIfUnchanged fixes); keep it when there is work to merge.
-            const removed = removeIfUnchanged(ctx.cwd, iso);
-            if (item.result !== null) {
-              item.result = `${item.result}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(iso)}`;
+    try {
+      await runGraph(
+        run.items,
+        DEFAULT_CONCURRENCY,
+        async (item, upstream) => {
+          const def = routeItem(item.item, defs, fixed);
+          item.agent = def.name;
+          const itemContext = contextFor(upstream);
+          if (isolate) {
+            try {
+              const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
+              await runItem(ctx, run.runId, def, item, itemContext, iso.path, mailbox);
+              // Remove the worktree when the item changed nothing (the leak
+              // removeIfUnchanged fixes); keep it when there is work to merge.
+              const removed = removeIfUnchanged(ctx.cwd, iso);
+              if (item.result !== null) {
+                item.result = `${item.result}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(iso)}`;
+              }
+            } catch (err) {
+              item.status = "error";
+              item.error = err instanceof Error ? err.message : String(err);
             }
-          } catch (err) {
-            item.status = "error";
-            item.error = err instanceof Error ? err.message : String(err);
+          } else {
+            await runItem(ctx, run.runId, def, item, itemContext, undefined, mailbox);
           }
-        } else {
-          await runItem(ctx, run.runId, def, item, itemContext, undefined, mailbox);
+        },
+        () => run.status === "cancelled",
+      );
+    } finally {
+      // The mailbox is per-run scratch: reclaim it however the run ends
+      // (finished, cancelled, or thrown) so a directory never accumulates.
+      if (mailbox) {
+        try {
+          rmSync(mailbox, { recursive: true, force: true });
+        } catch {
+          // best-effort: an unremovable scratch dir is not worth failing a run
         }
-      },
-      () => run.status === "cancelled",
-    );
+      }
+    }
 
     if (run.status !== "cancelled") run.status = "done";
     run.finishedAt = Date.now();

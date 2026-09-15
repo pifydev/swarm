@@ -24,6 +24,30 @@ export const MAX_MESSAGE_CHARS = 1200;
 export const MAX_INBOX_MESSAGES = 30;
 
 /**
+ * The two mailbox tool names. pi's child-session `tools` allowlist filters
+ * customTools too, so a mailbox tool that is not also named in the child's
+ * allowlist is registered and then silently dropped — the child is told it has
+ * no such tool. Naming them here keeps the allowlist and the tool definitions
+ * from drifting apart (mirrors how @pify/subagent wires ask_supervisor).
+ */
+export const MAILBOX_POST_TOOL = "swarm_post";
+export const MAILBOX_INBOX_TOOL = "swarm_inbox";
+export const MAILBOX_TOOL_NAMES = [MAILBOX_POST_TOOL, MAILBOX_INBOX_TOOL] as const;
+
+/**
+ * A per-run key for the mailbox directory. The run id ("s1", "s2", …) restarts
+ * at "s1" every session, so keying the dir on it alone made two different runs
+ * — a fresh "s1" and a previous session's "s1" — share one directory: the new
+ * run read the old run's stale messages, and the old dir was never reclaimed.
+ * Folding in the run's start time (base36-compact, and derived from the clock
+ * rather than Math.random so it stays deterministic and testable) gives every
+ * run its own directory, even two "s1"s from different sessions.
+ */
+export function mailboxKey(runId: string, startedAt: number): string {
+  return `${runId}-${Math.trunc(startedAt).toString(36)}`;
+}
+
+/**
  * One directory per run under the agent dir. Run ids are generated locally,
  * but this builds a filesystem path, so it stays a single flat segment: no
  * separators and no `..` can survive the sanitizer.
