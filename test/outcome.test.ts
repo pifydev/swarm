@@ -129,7 +129,7 @@ test("skip settles a dependent without running it, and the skip cascades", async
 
 // The vendored modules are shared with @pify/subagent; these cover the seams
 // this package actually depends on.
-test("gate verdicts and outcome precedence carry over", () => {
+test("gate verdicts and outcome precedence carry over", async () => {
   assert.equal(
     evaluateGate({ command: "t", expect: "\\d+ pass" }, { status: 0, signal: null, output: "no tests" }).outcome,
     "result_missing",
@@ -140,7 +140,7 @@ test("gate verdicts and outcome precedence carry over", () => {
   assert.equal(deriveOutcome({ status: "error" }), "failed");
   assert.equal(parseDeclaredOutcome("report\nOUTCOME: blocked"), "blocked");
   assert.equal(stripDeclaration("report\n\nOUTCOME: blocked"), "report");
-  assert.equal(runGate({ command: "node -e \"process.exit(0)\"" }, process.cwd()).outcome, "success");
+  assert.equal((await runGate({ command: "node -e \"process.exit(0)\"" }, process.cwd())).outcome, "success");
 });
 
 test("a failing gate spends one repair, then stands", async () => {

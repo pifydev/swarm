@@ -66,7 +66,12 @@ export function buildReport(run: SwarmRun): string {
       return `${label}\nSkipped — ${item.error ?? "something it needed did not succeed"}. Nothing ran, so nothing was spent on it.`;
     }
     if (item.status === "aborted") {
-      return `${label}\nAborted (turn cap or stop). Partial:\n${item.result ?? "(none)"}`;
+      // cancelRun writes who stopped the run and what that cost into `error`;
+      // a turn-cap stop leaves it empty. Either way the reader should not have
+      // to guess which one it was.
+      // cancelNote ends its sentence itself; do not add a second period.
+      const why = (item.error ?? "turn cap or stop").replace(/\.$/, "");
+      return `${label}\nAborted — ${why}. Partial:\n${item.result ?? "(none)"}`;
     }
     return `${label}\n(${item.status})`;
   });

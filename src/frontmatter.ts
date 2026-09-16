@@ -33,11 +33,13 @@ export function parseAgentFile(
 
   const thinkingRaw = fields.get("thinking")?.toLowerCase();
   const maxTurnsRaw = Number.parseInt(fields.get("max_turns") ?? "", 10);
+  const tools = parseTools(fields.get("tools"));
+  if (tools === null) return null;
 
   return {
     name: name.toLowerCase(),
     description,
-    tools: parseTools(fields.get("tools")),
+    tools,
     model: fields.get("model") || null,
     thinking: (THINKING_LEVELS as readonly string[]).includes(thinkingRaw ?? "")
       ? (thinkingRaw as ThinkingLevelName)
@@ -64,11 +66,20 @@ function parseList(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function parseTools(raw: string | undefined): ValidTool[] {
+/**
+ * Read-only default keeps a def missing `tools:` from mutating anything.
+ * A `tools:` line where NOTHING resolves is different: the author asked for
+ * a specific tool set and got the read-only default instead, so the agent
+ * runs with a contract nobody wrote. That is rejected — the file is dropped,
+ * rather than quietly running as something else. (Same rule as @pify/subagent.)
+ */
+function parseTools(raw: string | undefined): ValidTool[] | null {
   if (!raw) return ["read", "grep", "find", "ls"];
-  const valid = raw
+  const requested = raw
     .split(",")
     .map((t) => t.trim().toLowerCase())
-    .filter((t): t is ValidTool => (VALID_TOOLS as readonly string[]).includes(t));
-  return valid.length > 0 ? valid : ["read", "grep", "find", "ls"];
+    .filter(Boolean);
+  if (requested.length === 0) return ["read", "grep", "find", "ls"];
+  const valid = requested.filter((t): t is ValidTool => (VALID_TOOLS as readonly string[]).includes(t));
+  return valid.length > 0 ? valid : null;
 }

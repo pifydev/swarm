@@ -33,7 +33,7 @@ Blocking by default: returns `N succeeded, M failed` plus a per-item report.
 
 ### Gates and outcomes
 
-A gate asks the shell, not a model. Each item's gate runs in the tree that item worked in — its own worktree under `isolation: "worktree"` — after the child finishes, so it judges what you would merge. A failing gate sends the child back once with the command, the verdict and the output, then re-runs; `gateRepairs: 0` turns that off. A read-only agent is never asked to repair.
+A gate asks the shell, not a model. Each item's gate runs in the tree that item worked in — its own worktree under `isolation: "worktree"` — after the child finishes, so it judges what you would merge. It runs asynchronously: pi keeps rendering, Esc still lands, and the other children's streams are still read while a two-minute suite runs; at the deadline the whole process tree is killed, not just the shell that started it, so a timed-out suite does not run on holding the pipes open. A failing gate sends the child back once with the command, the verdict and the output, then re-runs; `gateRepairs: 0` turns that off. That repair brief is the whole prompt the child gets — it quotes the original task under `== Original task ==` and says to fix the cause and stop, not to do the task again — and the child rejoins the run's mailbox. A read-only agent is never asked to repair, and neither is a child that ended its report with `OUTCOME: blocked`: the wall it named is outside its reach, and a failing gate does not move it. The gate still runs once so the report says what it proved. While a repair is in flight the item shows as running, not finished.
 
 The verdict can say more than pass/fail: `success`, `failure`, `result_missing` (exited 0 but never showed the evidence `gateExpect` asked for — a runner that matched no tests), `timeout`, or `no_attestation` (never ran at all — a typo, a missing runner; not a verdict on the work, and never repaired). If other items were changing the same directory while a gate ran, the report says the verdict is true of the tree, not of that item alone — which is what `isolation` is for.
 
@@ -66,8 +66,9 @@ The whole graph is checked **before anything spawns**: a cycle, a self-edge, a d
 | Parameter | Type | Notes |
 |---|---|---|
 | `runId` | string, optional | Defaults to the most recent run |
+| `wait` | number, optional | Seconds to hold the call for the run to finish, 0–120 (default 0) |
 
-Live per-item progress (`1:scout=running(3t) · 2:reviewer=queued`), and the full report once the run finishes. Completed runs survive `/reload`.
+A "not ready" answer while the run is in flight (per-item progress is on the widget and in `/swarm`), and the full report once the run finishes. Completed runs survive `/reload`. `wait` is for the headless case (`pi -p`), where nothing is delivered after the turn ends: one call that waits returns the report in one turn instead of several; the wait ends early on Esc.
 
 ### `swarm_post` / `swarm_inbox`
 
@@ -98,16 +99,18 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 ## Behaviour
 
 - **Independence by design.** Items share nothing, children cannot spawn children, and each child is capped at its agent's `max_turns`.
-- **Stopping stops the children.** Pressing Esc, or switching away from the session, aborts every live child rather than leaving them talking to the provider on your money. A cancelled run keeps that verdict — it is never reported as done — and `swarm_status` shows what the items that did finish produced.
+- **Stopping stops the children.** Pressing Esc stops a foreground run, `/swarm stop [runId]` stops a background one (its tool call returned long ago, so Esc has nothing to reach), and switching away from the session stops both — in every case every live child is aborted rather than left talking to the provider on your money. A cancelled run keeps that verdict — it is never reported as done — and `swarm_status` shows what the items that did finish produced, with each stopped item saying who stopped it.
 - **Isolated runs clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; otherwise a read-only step left one of each behind on every run. Anything uncommitted, and any commit the child made, is kept and reported.
 
 ## A background run comes back to you
 
-`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. The aggregated report is **delivered** into the conversation when the run finishes — measured, not assumed: `test/live/delivery-wire.mjs` drives a real background swarm through pi, holds the session open the way an interactive one naturally stays open, and reads the report out of pi's own provider payload (3/3; the run finished and the report arrived unasked). One caveat the measurement taught: delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not. Asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired: false` — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
+`swarm_status` on a run still in flight used to say "still running", which left the model one option: ask again. The aggregated report is **delivered** into the conversation when the run finishes — measured, not assumed: `test/live/delivery-wire.mjs` drives a real background swarm through pi, holds the session open the way an interactive one naturally stays open, and reads the report out of pi's own provider payload (3/3; the run finished and the report arrived unasked). One caveat the measurement taught: delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not. Asking early returns a structured result carrying `retryable`, the elapsed time and `pollRequired` (`false` interactively; `true` under `pi -p`, where the text tells the model to collect within the turn or use `wait`) — a normal answer rather than an error, because a tool error over a condition only time resolves invites the model's retry machinery into a loop.
 
 ## Command
 
 `/swarm` — runs in this session, and the agent types available for routing.
+
+`/swarm stop [runId]` — cancel a live run (default: the active one) and abort its children. The way to stop a background run; a foreground run stops on Esc.
 
 ## Where this sits in the suite
 

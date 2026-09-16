@@ -52,9 +52,18 @@ import {
 } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildReport, buildStatusLine, earlyFailureNotice } from "../src/report.ts";
-import { normalizeGate, runGate, sharedWith, type GateContract, type GateSibling } from "../src/gate.ts";
+import {
+  normalizeGate,
+  runGate,
+  sharedWith,
+  type GateContract,
+  type GateSibling,
+  type GateVerdict,
+} from "../src/gate.ts";
 import { runGateCycle } from "../src/repair.ts";
+import { repairAllowed } from "../src/repair-policy.ts";
 import { deriveOutcome, parseDeclaredOutcome, stripDeclaration } from "../src/outcome.ts";
+import { waitUntil } from "../src/wait.ts";
 import { routeItem } from "../src/routing.ts";
 import { normalizeItems } from "../src/graph.ts";
 import { runGraph } from "../src/schedule.ts";
@@ -72,6 +81,8 @@ import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "no
 import { basename, join } from "node:path";
 
 const RUN_ENTRY = "swarm-run";
+/** Longest a swarm_status call may hold on to a running run, in seconds. */
+const MAX_STATUS_WAIT_S = 120;
 const CLEAN_WORKTREE_NOTE =
   "Ran isolated in a temporary worktree; it changed nothing, so the worktree was removed.";
 
@@ -196,6 +207,12 @@ export default function swarm(pi: ExtensionAPI) {
     workDir?: string,
     mailbox?: string,
   ): Promise<void> {
+    // A stop can land before this item has a session to abort — the scheduler
+    // launched it, the loader is still reloading — and cancelRun has already
+    // written its record. Starting anyway would overwrite that with "running"
+    // and leave a child no stop can reach.
+    const cancelled = (): boolean => runs.get(runId)?.status === "cancelled";
+    if (cancelled()) return;
     item.status = "running";
     renderWidget();
     let session: AgentSession | null = null;
@@ -233,7 +250,17 @@ export default function swarm(pi: ExtensionAPI) {
         appendSystemPrompt: [
           ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
           def.systemPrompt,
-          "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — make it complete and self-contained.",
+          // The same contract subagent's children get, including the OUTCOME
+          // line: the report tallies `blocked`, and skip-on-upstream-failure
+          // keys off the outcome, so a child that is never told the protocol
+          // can never be anything but succeeded or failed.
+          "You are one agent in a swarm, handling exactly one item. Your final assistant message is the deliverable — " +
+            "make it complete and self-contained; the swarm cannot reply to it. Close by stating each requirement of your " +
+            "item and the concrete evidence it is met (the command you ran and what it showed); mark anything you could " +
+            "not verify as unverified rather than done. Finishing your turn is not the same as finishing the item: if you " +
+            "could not do it, end the report with a line reading exactly `OUTCOME: blocked` (a decision, access or " +
+            "information you do not have) or `OUTCOME: failed` (you tried and it does not work), so the swarm does not " +
+            "have to infer it from your prose. Say nothing if it went fine.",
           ...(mailbox ? [mailboxPrompt(item.agent + "-" + item.index)] : []),
         ],
       });
@@ -251,6 +278,9 @@ export default function swarm(pi: ExtensionAPI) {
         resourceLoader: loader,
       });
       session = created.session;
+      // Same window, other side: a stop during session creation found nothing
+      // registered. Do not prompt a child of a run that is already over.
+      if (cancelled()) return;
       releaseLive = live.register(runId, session);
 
       const guard = new LoopGuard();
@@ -350,15 +380,6 @@ export default function swarm(pi: ExtensionAPI) {
   }
 
   /**
-   * Readiness scheduler: run each item as soon as its `needs` are done, up to
-   * DEFAULT_CONCURRENCY at once. A flat run (no needs anywhere) makes every
-   * item ready immediately, so this is identical to the old parallel pool.
-   */
-  /** An agent that can write is one that can fix what a gate complained about. */
-  const canWrite = (def: AgentDef) =>
-    def.tools.some((t) => t === "edit" || t === "write" || t === "bash" || t === "powershell");
-
-  /**
    * Settle the two facts the status alone cannot give: what the item's task came
    * to, and how well that is known. Settled once — re-running it after the
    * isolation note is appended would find the declaration already stripped and
@@ -393,29 +414,70 @@ export default function swarm(pi: ExtensionAPI) {
     def: AgentDef,
     opts: RunOptions,
   ): Promise<void> {
-    if (!opts.gate || item.status !== "done") return;
+    // A cancelled run has nothing left to prove; a gate is a test suite, and
+    // spending one on work nobody is waiting for is the stop not stopping.
+    if (!opts.gate || item.status !== "done" || run.status === "cancelled") return;
     const subject = item.workDir ?? ctx.cwd;
-    const self: GateSibling = { id: item.index, label: item.id, status: item.status, workDir: item.workDir };
+    // sharedWith() reads an undefined workDir as "the subject's directory", so
+    // an item that ran in place — no worktree of its own — would count as
+    // sharing every isolated sibling's worktree, and every isolated item's
+    // pass came out attributed to the tree. Name the directory each item was
+    // actually in.
+    const dirOf = (i: ItemState): string => i.workDir ?? ctx.cwd;
+    const self: GateSibling = { id: item.index, label: item.id, status: item.status, workDir: dirOf(item) };
     const siblings: GateSibling[] = run.items
       .filter((i) => i.index !== item.index)
-      .map((i) => ({ id: i.index, label: i.id, status: i.status, workDir: i.workDir }));
+      .map((i) => ({ id: i.index, label: i.id, status: i.status, workDir: dirOf(i) }));
+    // Read the child's declaration now, while it is still in the result:
+    // settleItem strips it, and a blocked child is not sent to fix a gate.
+    const canRepair = repairAllowed(def, item.result);
     try {
+      // The gate that actually ran, whatever the cycle reports. After a repair
+      // the cycle re-runs the gate; on a cancelled run that is up to the whole
+      // deadline spent proving nothing anyone will read — but a check that
+      // DID run and failed before the stop landed is a real verdict, and
+      // answering no_attestation for it would file a failed gate as
+      // "proved nothing", which is the case the outcome model exists to stop.
+      let last: (GateVerdict & { output: string }) | null = null;
+      let repaired = false;
       const { record, verification } = await runGateCycle(item.item, opts.gate, subject, {
-        runGate,
-        canRepair: canWrite(def),
+        runGate: async (contract, cwd) => {
+          if (run.status === "cancelled" && last) return last;
+          last = await runGate(contract, cwd);
+          return last;
+        },
+        canRepair,
         maxAttempts: opts.gateRepairs ?? 1,
         sharedWith: sharedWith(self, subject, siblings),
         repair: async (prompt) => {
-          // The repair is the same child type over the same tree; its report
+          if (run.status === "cancelled") return;
+          repaired = true;
+          // The brief IS the item. Handed over as `context` it arrived as "fix
+          // exactly this" followed by the whole original task under `Your
+          // item:`, which reads as an invitation to do the task again. The
+          // brief already quotes the task; nothing else is sent.
+          //
+          // The repair is the same child type over the same tree, in the same
+          // mailbox — the siblings' facts still apply — and its report
           // replaces the stale one, which described a tree that has changed.
-          const fix: ItemState = { ...item, result: null, error: null, status: "queued", turns: 0 };
-          await runItem(ctx, run.runId, def, fix, prompt, item.workDir, undefined);
+          const fix: ItemState = { ...item, item: prompt, result: null, error: null, status: "queued", turns: 0, tokens: 0 };
+          // The widget draws `item`, not `fix`; without this the row sat as a
+          // finished ✓ for the whole repair.
+          item.status = "running";
+          renderWidget();
+          await runItem(ctx, run.runId, def, fix, "", item.workDir, opts.mailbox);
           item.turns += fix.turns;
           item.tokens += fix.tokens;
+          // cancelRun may have marked the item aborted meanwhile; that verdict
+          // and its note stand, and the stale result is not swapped under it.
+          if (item.status !== "running") return;
+          item.status = "done";
           if (fix.status === "done" && fix.result?.trim()) item.result = fix.result;
         },
       });
-      item.gate = record;
+      // The cycle counts a repair pass it asked for; one the stop refused is
+      // not a repair, and the record must not say the tree was fixed.
+      item.gate = repaired ? record : { ...record, repairs: undefined };
       item.verification = verification;
     } catch (err) {
       // A gate that throws proved nothing; say so rather than losing the
@@ -437,6 +499,8 @@ export default function swarm(pi: ExtensionAPI) {
     useMailbox?: boolean;
     gate?: GateContract;
     gateRepairs?: number;
+    /** The run's mailbox dir once executeRun has made one, so a repair child joins the same log. */
+    mailbox?: string;
     onUpstreamFailure?: UpstreamFailurePolicy;
     /** Called once, for the first item that settles badly while others run. */
     onEarlyFailure?: (item: ItemState) => void;
@@ -450,6 +514,7 @@ export default function swarm(pi: ExtensionAPI) {
     const mailbox = useMailbox
       ? mailboxDir(getAgentDir(), mailboxKey(run.runId, run.startedAt))
       : undefined;
+    const gateOpts: RunOptions = { ...opts, mailbox };
 
     // A dependent structurally receives each upstream's output — the thing a
     // hand-sequenced coordinator forgets. Prepended to the shared preamble.
@@ -501,7 +566,7 @@ export default function swarm(pi: ExtensionAPI) {
               const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
               item.workDir = iso.path;
               await runItem(ctx, run.runId, def, item, itemContext, iso.path, mailbox);
-              await gateItem(ctx, run, item, def, opts);
+              await gateItem(ctx, run, item, def, gateOpts);
               // Remove the worktree when the item changed nothing (the leak
               // removeIfUnchanged fixes); keep it when there is work to merge.
               const removed = removeIfUnchanged(ctx.cwd, iso);
@@ -514,7 +579,7 @@ export default function swarm(pi: ExtensionAPI) {
             }
           } else {
             await runItem(ctx, run.runId, def, item, itemContext, undefined, mailbox);
-            await gateItem(ctx, run, item, def, opts);
+            await gateItem(ctx, run, item, def, gateOpts);
           }
           settle(item);
         },
@@ -745,6 +810,11 @@ export default function swarm(pi: ExtensionAPI) {
         };
         void executeRun(uiCtx, run, options)
           .then(() => {
+            // A run the user just stopped is not one that "finished", and the
+            // model is not woken to fold in a report of work that was
+            // cancelled out from under it. The stop already said what it
+            // stopped; what the items produced is in swarm_status.
+            if (run.status === "cancelled") return;
             notify(uiCtx, `swarm ${run.runId} finished`, "info");
             // The report goes to the agent, not only to the screen — otherwise
             // asking again was its only way to find out.
@@ -768,7 +838,14 @@ export default function swarm(pi: ExtensionAPI) {
           });
         return {
           content: [
-            { type: "text", text: `Swarm ${run.runId} started (${run.items.length} items). Poll swarm_status runId="${run.runId}".` },
+            {
+              type: "text",
+              text:
+                `Swarm ${run.runId} started (${run.items.length} items) in the background. Its report is delivered to you ` +
+                `when it finishes, and the first hard failure interrupts you early — do not poll. ` +
+                `swarm_status runId="${run.runId}" shows progress if you need it early. ` +
+                `The user can stop it with /swarm stop ${run.runId} (Esc does not reach a background run).`,
+            },
           ],
           details: { runId: run.runId },
         };
@@ -790,22 +867,47 @@ export default function swarm(pi: ExtensionAPI) {
     name: "swarm_status",
     label: "Swarm status",
     promptSnippet: "Progress of a running swarm",
-    description: "Progress of a swarm run (default: the latest). Returns the full report when finished.",
+    description:
+      "Progress of a swarm run (default: the latest). Returns the full report when finished. " +
+      "wait=N (seconds, up to 120) holds this call until the run finishes or N seconds pass, so a headless " +
+      "session can collect the report in one call instead of asking repeatedly.",
     parameters: Type.Object({
       runId: Type.Optional(Type.String()),
+      wait: Type.Optional(
+        Type.Number({
+          description: "Seconds to wait for the run to finish before answering, 0-120 (default 0)",
+          minimum: 0,
+          maximum: MAX_STATUS_WAIT_S,
+        }),
+      ),
     }),
-    async execute(_id, params: { runId?: string }) {
+    async execute(_id, params: { runId?: string; wait?: number }, signal, _onUpdate, ctx) {
       const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
       if (!run) throw new Error("No swarm runs this session.");
+      // Bounded and abortable: the wait is the caller's turn, and Esc must end
+      // it the way it ends anything else the tool call is doing.
+      const waitMs = Math.max(0, Math.min(MAX_STATUS_WAIT_S, params.wait ?? 0)) * 1000;
+      if (run.status === "running" && waitMs > 0) {
+        await waitUntil(() => run.status !== "running", waitMs, 250, signal);
+      }
       if (run.status === "running") {
+        const interactive = (ctx as { hasUI?: boolean }).hasUI !== false;
         const pending = pendingResult({
           id: run.runId,
           kind: "running",
           startedAt: run.startedAt,
           now: Date.now(),
           collectWith: "swarm_status",
+          // A headless `pi -p` run ends with this turn: "it will be delivered"
+          // is a promise nothing can keep there, so the text says to collect.
+          interactive,
         });
-        return { content: [{ type: "text", text: pending.text }], details: pending.details as never };
+        // Headless is where repeated calls actually happen; one call that
+        // waits is the same answer for one turn instead of several.
+        const text = interactive
+          ? pending.text
+          : `${pending.text}\nPass wait=${MAX_STATUS_WAIT_S} (seconds) to swarm_status to hold one call until it finishes instead of asking again.`;
+        return { content: [{ type: "text", text }], details: pending.details as never };
       }
       const text =
         run.status === "cancelled"
@@ -890,9 +992,33 @@ export default function swarm(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("swarm", {
-    description: "Show swarm runs and routing-capable agent types",
-    handler: async (_args, ctx) => {
+    description: "Show swarm runs and agent types; /swarm stop [runId] cancels a live run",
+    handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      if (words[0] === "stop") {
+        // Esc reaches a foreground run through its tool call's signal; a
+        // background run's tool call returned long ago, so until this command
+        // nothing the user could do reached its children.
+        const wanted = words[1];
+        const run = wanted ? runs.get(wanted) : activeRun;
+        if (!run) {
+          ctx.ui.notify(wanted ? `No swarm run ${wanted}.` : "No swarm run to stop.", "warning");
+          return;
+        }
+        if (run.status !== "running") {
+          ctx.ui.notify(`swarm ${run.runId} is not running (${run.status}).`, "warning");
+          return;
+        }
+        const before = live.count(run.runId);
+        cancelRun(run, "user-abort");
+        ctx.ui.notify(
+          `swarm ${run.runId} stopped — ${before === 0 ? "no child agents were running" : `${before} child agent${before === 1 ? "" : "s"} stopped`}.`,
+          "info",
+        );
+        renderWidget(ctx);
+        return;
+      }
       const routed = [...defs.values()]
         .map((d) => {
           const rules = [
