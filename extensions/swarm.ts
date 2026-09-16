@@ -22,6 +22,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
@@ -50,7 +51,10 @@ import {
   readInbox,
 } from "../src/mailbox.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
-import { buildReport, buildStatusLine } from "../src/report.ts";
+import { buildReport, buildStatusLine, earlyFailureNotice } from "../src/report.ts";
+import { normalizeGate, runGate, sharedWith, type GateContract, type GateSibling } from "../src/gate.ts";
+import { runGateCycle } from "../src/repair.ts";
+import { deriveOutcome, parseDeclaredOutcome, stripDeclaration } from "../src/outcome.ts";
 import { routeItem } from "../src/routing.ts";
 import { normalizeItems } from "../src/graph.ts";
 import { runGraph } from "../src/schedule.ts";
@@ -62,6 +66,7 @@ import {
   type AgentDef,
   type ItemState,
   type SwarmRun,
+  type UpstreamFailurePolicy,
 } from "../src/types.ts";
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -349,14 +354,96 @@ export default function swarm(pi: ExtensionAPI) {
    * DEFAULT_CONCURRENCY at once. A flat run (no needs anywhere) makes every
    * item ready immediately, so this is identical to the old parallel pool.
    */
-  async function executeRun(
+  /** An agent that can write is one that can fix what a gate complained about. */
+  const canWrite = (def: AgentDef) =>
+    def.tools.some((t) => t === "edit" || t === "write" || t === "bash" || t === "powershell");
+
+  /**
+   * Settle the two facts the status alone cannot give: what the item's task came
+   * to, and how well that is known. Settled once — re-running it after the
+   * isolation note is appended would find the declaration already stripped and
+   * quietly promote a blocked item to a successful one.
+   */
+  function settleItem(item: ItemState): void {
+    if (item.status === "queued" || item.status === "running" || item.outcome) return;
+    // A skipped item was never attempted, so it has no outcome to report — not
+    // a failure of its own, and calling it one would double-count the upstream
+    // failure that caused it.
+    if (item.status === "skipped") return;
+    const declared = parseDeclaredOutcome(item.result);
+    if (declared && item.result) item.result = stripDeclaration(item.result);
+    item.verification ??= "not-requested";
+    item.outcome = deriveOutcome({
+      status: item.status === "done" ? "done" : item.status === "aborted" ? "aborted" : "error",
+      declared,
+      verification: item.verification,
+    });
+  }
+
+  /**
+   * Run the caller's gate in the tree this item worked in and, if it failed,
+   * send the child back to fix it. Recorded either way — a gate that passed is
+   * a fact worth saying, and a gate that could not run says so rather than
+   * blaming the work.
+   */
+  async function gateItem(
     ctx: UiContext,
     run: SwarmRun,
-    context: string,
-    fixed?: string,
-    isolate?: boolean,
-    useMailbox?: boolean,
+    item: ItemState,
+    def: AgentDef,
+    opts: RunOptions,
   ): Promise<void> {
+    if (!opts.gate || item.status !== "done") return;
+    const subject = item.workDir ?? ctx.cwd;
+    const self: GateSibling = { id: item.index, label: item.id, status: item.status, workDir: item.workDir };
+    const siblings: GateSibling[] = run.items
+      .filter((i) => i.index !== item.index)
+      .map((i) => ({ id: i.index, label: i.id, status: i.status, workDir: i.workDir }));
+    try {
+      const { record, verification } = await runGateCycle(item.item, opts.gate, subject, {
+        runGate,
+        canRepair: canWrite(def),
+        maxAttempts: opts.gateRepairs ?? 1,
+        sharedWith: sharedWith(self, subject, siblings),
+        repair: async (prompt) => {
+          // The repair is the same child type over the same tree; its report
+          // replaces the stale one, which described a tree that has changed.
+          const fix: ItemState = { ...item, result: null, error: null, status: "queued", turns: 0 };
+          await runItem(ctx, run.runId, def, fix, prompt, item.workDir, undefined);
+          item.turns += fix.turns;
+          item.tokens += fix.tokens;
+          if (fix.status === "done" && fix.result?.trim()) item.result = fix.result;
+        },
+      });
+      item.gate = record;
+      item.verification = verification;
+    } catch (err) {
+      // A gate that throws proved nothing; say so rather than losing the
+      // child's work to an error in the checking machinery.
+      item.gate = {
+        command: opts.gate.command,
+        outcome: "no_attestation",
+        ok: false,
+        reason: `gate could not be run: ${err instanceof Error ? err.message : String(err)}`,
+      };
+      item.verification = "inconclusive";
+    }
+  }
+
+  interface RunOptions {
+    context: string;
+    fixed?: string;
+    isolate?: boolean;
+    useMailbox?: boolean;
+    gate?: GateContract;
+    gateRepairs?: number;
+    onUpstreamFailure?: UpstreamFailurePolicy;
+    /** Called once, for the first item that settles badly while others run. */
+    onEarlyFailure?: (item: ItemState) => void;
+  }
+
+  async function executeRun(ctx: UiContext, run: SwarmRun, opts: RunOptions): Promise<void> {
+    const { context, fixed, isolate, useMailbox } = opts;
     // One shared log per run; only created when the caller asked for it. Keyed
     // on a per-run token (not the reused "s1" run id), so one run never reads a
     // previous run's stale messages, and removed at the end so it never leaks.
@@ -375,6 +462,18 @@ export default function swarm(pi: ExtensionAPI) {
       return [context, ...blocks].filter((s) => s && s.trim()).join("\n\n");
     };
 
+    // The first hard failure wakes the caller once, and only while there is
+    // still a run to warn it about; after that the aggregate report is the
+    // report. N interrupts for N failures would be worse than none.
+    let warned = false;
+    const settle = (item: ItemState): void => {
+      settleItem(item);
+      if (warned || !opts.onEarlyFailure) return;
+      if (item.outcome !== "failed" || item.status === "aborted") return;
+      warned = true;
+      opts.onEarlyFailure(item);
+    };
+
     // Run each item once its needs finish, up to the concurrency cap; a flat
     // run (no needs) has everything ready at once, exactly like the old pool.
     try {
@@ -382,13 +481,27 @@ export default function swarm(pi: ExtensionAPI) {
         run.items,
         DEFAULT_CONCURRENCY,
         async (item, upstream) => {
+          // A failed node still counts as done so the graph drains rather than
+          // wedging — but "unblocked" and "worth running" are different
+          // questions. With skip, a dependent of work that did not succeed is
+          // settled without spending a child on input that is a failure notice.
+          const broken = upstream.filter((up) => up.status !== "done" || up.outcome !== "succeeded");
+          if (opts.onUpstreamFailure === "skip" && broken.length > 0) {
+            item.status = "skipped";
+            item.error = `${broken.map((u) => u.id).join(", ")} did not succeed`;
+            settleItem(item);
+            renderWidget();
+            return;
+          }
           const def = routeItem(item.item, defs, fixed);
           item.agent = def.name;
           const itemContext = contextFor(upstream);
           if (isolate) {
             try {
               const iso = createIsolationWorktree(ctx.cwd, run.runId + "-i" + (item.index + 1));
+              item.workDir = iso.path;
               await runItem(ctx, run.runId, def, item, itemContext, iso.path, mailbox);
+              await gateItem(ctx, run, item, def, opts);
               // Remove the worktree when the item changed nothing (the leak
               // removeIfUnchanged fixes); keep it when there is work to merge.
               const removed = removeIfUnchanged(ctx.cwd, iso);
@@ -401,7 +514,9 @@ export default function swarm(pi: ExtensionAPI) {
             }
           } else {
             await runItem(ctx, run.runId, def, item, itemContext, undefined, mailbox);
+            await gateItem(ctx, run, item, def, opts);
           }
+          settle(item);
         },
         () => run.status === "cancelled",
       );
@@ -418,6 +533,10 @@ export default function swarm(pi: ExtensionAPI) {
     }
 
     if (run.status !== "cancelled") run.status = "done";
+    // A cancelled run's items were marked aborted without going through the
+    // scheduler's settle path; the report still has to be able to name what
+    // each one came to.
+    for (const item of run.items) settleItem(item);
     run.finishedAt = Date.now();
     pi.appendEntry(RUN_ENTRY, run);
     renderWidget();
@@ -459,7 +578,11 @@ export default function swarm(pi: ExtensionAPI) {
       "conventions instead of silently conflicting. " +
       "An item can be a plain string (independent) OR an object {task, id, needs:[ids]} to declare a " +
       "dependency: a needed item's output is prepended to the dependent automatically, and the dependent " +
-      "starts only once its needs finish. A cycle, a self-edge, or an unknown id is rejected before anything runs.",
+      "starts only once its needs finish. A cycle, a self-edge, or an unknown id is rejected before anything runs. " +
+      "gate is a command every item must pass — it runs in that item's own working directory when it finishes, " +
+      "a failure sends the child back to fix it once, and the report says what the check proved rather than " +
+      "only what the child claims. on_upstream_failure=skip settles a dependent without spending a child when " +
+      "something it needed did not succeed.",
     parameters: Type.Object({
       items: Type.Array(
         Type.Union([
@@ -480,6 +603,27 @@ export default function swarm(pi: ExtensionAPI) {
       mailbox: Type.Optional(
         Type.Boolean({ description: "Give the agents swarm_post/swarm_inbox to share facts mid-run" }),
       ),
+      gate: Type.Optional(
+        Type.String({
+          description:
+            "Shell command every item must pass, e.g. \"bun test\". Run in that item's working directory once it finishes.",
+        }),
+      ),
+      gateExpect: Type.Optional(
+        Type.String({
+          description:
+            "Regex the gate output must match. Use it when exit 0 does not prove the check ran; exiting 0 without a match is reported as verifying nothing.",
+        }),
+      ),
+      gateRepairs: Type.Optional(
+        Type.Number({ description: "Repair passes per item after a failed gate, 0-5 (default 1)" }),
+      ),
+      on_upstream_failure: Type.Optional(
+        StringEnum(["continue", "skip"], {
+          description:
+            "What a dependent does when something it needs did not succeed: continue (default, it runs and is told) or skip (it is settled without spending a child)",
+        }),
+      ),
       background: Type.Optional(Type.Boolean()),
     }),
     async execute(
@@ -491,6 +635,10 @@ export default function swarm(pi: ExtensionAPI) {
         background?: boolean;
         isolation?: string;
         mailbox?: boolean;
+        gate?: string;
+        gateExpect?: string;
+        gateRepairs?: number;
+        on_upstream_failure?: UpstreamFailurePolicy;
       },
       signal,
       _onUpdate,
@@ -507,6 +655,25 @@ export default function swarm(pi: ExtensionAPI) {
       }
       if (activeRun?.status === "running") {
         throw new Error(`Swarm ${activeRun.runId} is still running — wait or check swarm_status.`);
+      }
+
+      // A gate is validated up front: a broken contract should be a tool error
+      // the caller can fix now, not a "verified nothing" verdict on every item
+      // after a whole fan-out has already been spent.
+      let gate: GateContract | undefined;
+      if (params.gate?.trim()) {
+        gate = normalizeGate(params.gate.trim());
+        const expect = params.gateExpect?.trim();
+        if (expect) {
+          try {
+            new RegExp(expect, "m");
+          } catch {
+            throw new Error(`gateExpect is not a valid regular expression: ${expect}`);
+          }
+          gate.expect = expect;
+        }
+      } else if (params.gateExpect?.trim()) {
+        throw new Error("gateExpect needs a gate command to judge.");
       }
 
       runCounter++;
@@ -545,8 +712,38 @@ export default function swarm(pi: ExtensionAPI) {
         }
       }
 
+      const options: RunOptions = {
+        context: params.context ?? "",
+        fixed: params.agent,
+        isolate: params.isolation === "worktree",
+        useMailbox: params.mailbox === true,
+        gate,
+        gateRepairs: params.gateRepairs,
+        onUpstreamFailure: params.on_upstream_failure,
+      };
+
       if (run.background) {
-        void executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true)
+        // A background run's caller is off doing something else, so the first
+        // hard failure interrupts it the way @pify/subagent already interrupts
+        // for a failed background child. A foreground run is already blocking
+        // that turn, so there is nothing to interrupt.
+        options.onEarlyFailure = (item) => {
+          try {
+            pi.sendMessage(
+              {
+                customType: DELIVERY_TYPE,
+                content: earlyFailureNotice(run, item),
+                display: true,
+                details: { runId: run.runId, item: item.id, status: item.status },
+              },
+              { deliverAs: "steer", triggerTurn: true },
+            );
+          } catch {
+            // A warning that cannot be delivered must not take the run with it;
+            // the aggregate report is still coming.
+          }
+        };
+        void executeRun(uiCtx, run, options)
           .then(() => {
             notify(uiCtx, `swarm ${run.runId} finished`, "info");
             // The report goes to the agent, not only to the screen — otherwise
@@ -578,7 +775,7 @@ export default function swarm(pi: ExtensionAPI) {
       }
 
       try {
-        await executeRun(uiCtx, run, params.context ?? "", params.agent, params.isolation === "worktree", params.mailbox === true);
+        await executeRun(uiCtx, run, options);
       } finally {
         if (stopListening) stopListening();
       }

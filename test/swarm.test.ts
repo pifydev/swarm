@@ -125,7 +125,9 @@ test("buildReport aggregates counts and sections", () => {
       item({ index: 2, status: "aborted", result: "partial" }),
     ]),
   );
-  assert.ok(report.includes("3 items — 1 done, 1 error, 1 aborted"));
+  // The header counts outcomes, not statuses: an item that ran to the end is
+  // only a success if nothing said otherwise.
+  assert.ok(report.includes("3 items — 1 succeeded, 2 failed"), report);
   assert.ok(report.includes("### 1. [scout] review x\nok A"));
   assert.ok(report.includes("Error: boom"));
   assert.ok(report.includes("Partial:\npartial"));

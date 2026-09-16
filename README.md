@@ -23,9 +23,25 @@ The catch is that "independent" is usually a small lie — the items do not depe
 | `agent` | string, optional | Force one agent type for all items instead of routing |
 | `isolation` | `"worktree"`, optional | Give each item its own git worktree — use it when items write |
 | `mailbox` | boolean, optional | Give the children `swarm_post` / `swarm_inbox` |
+| `gate` | string, optional | A command every item must pass — `bun test`, `tsc --noEmit` — run in that item's own working directory |
+| `gateExpect` | string, optional | Regex the gate output must match, for checks that exit 0 without proving anything |
+| `gateRepairs` | number, optional | Repair passes per item after a failed gate, 0–5 (default 1) |
+| `on_upstream_failure` | `"continue"` / `"skip"`, optional | What a dependent does when something it needs did not succeed (default `continue`) |
 | `background` | boolean, optional | Return a `runId` immediately instead of blocking |
 
-Blocking by default: returns `N done, M error` plus a per-item report.
+Blocking by default: returns `N succeeded, M failed` plus a per-item report.
+
+### Gates and outcomes
+
+A gate asks the shell, not a model. Each item's gate runs in the tree that item worked in — its own worktree under `isolation: "worktree"` — after the child finishes, so it judges what you would merge. A failing gate sends the child back once with the command, the verdict and the output, then re-runs; `gateRepairs: 0` turns that off. A read-only agent is never asked to repair.
+
+The verdict can say more than pass/fail: `success`, `failure`, `result_missing` (exited 0 but never showed the evidence `gateExpect` asked for — a runner that matched no tests), `timeout`, or `no_attestation` (never ran at all — a typo, a missing runner; not a verdict on the work, and never repaired). If other items were changing the same directory while a gate ran, the report says the verdict is true of the tree, not of that item alone — which is what `isolation` is for.
+
+Every item then reports two facts. Its **status** says whether the child finished; its **outcome** says whether the task did. A failed gate outranks a child that claims success; without a gate the outcome is the child's own account, and a child that could not finish can end its report with `OUTCOME: blocked` or `OUTCOME: failed` to say so in one parseable place. The header counts outcomes, so an item that ran to the end and failed its check is filed under `failed`, not `done` — and the widget shows it as ✗, not ✓.
+
+**Failures interrupt.** A background run wakes you once, as soon as the first item fails hard, while the rest are still running — the same rule `@pify/subagent` uses for a failed background child. The message says it is a warning and that the full report still follows; it does not ask you to poll. Subsequent failures wait for the aggregate report, since N interrupts for N failures would be worse than none.
+
+**`on_upstream_failure`.** By default a dependent still runs when something it needed failed, with a `(failed: …)` notice in place of that item's output — visible, but it spends a child on a step that is usually doomed. `skip` settles the dependent instead, marks it `skipped` (its own state, not a second failure), and the skip cascades down the branch. Independent items are unaffected either way.
 
 ### Dependencies: `needs`
 

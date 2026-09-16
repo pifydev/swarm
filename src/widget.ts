@@ -1,21 +1,39 @@
 import { clampRows, clampWidth, MAX_WIDGET_ROWS } from "./widget-clamp.ts";
-import type { SwarmRun, ThemeLike } from "./types.ts";
+import type { ItemState, SwarmRun, ThemeLike } from "./types.ts";
 
 const WIDTH = 54;
 
-function icon(status: string): string {
-  switch (status) {
+/**
+ * The row reports the *task*, not the child session. An item whose agent ran to
+ * the end and then failed its gate used to sit here as a green ✓, which is
+ * precisely the confusion the outcome field exists to remove.
+ */
+function icon(item: ItemState): string {
+  switch (item.status) {
     case "queued":
       return "·";
     case "running":
       return "⟳";
+    case "skipped":
+      return "⊘";
     case "done":
-      return "✓";
+      return item.outcome === "failed" ? "✗" : item.outcome === "blocked" ? "⚠" : "✓";
     case "error":
       return "✗";
     default:
       return "◼";
   }
+}
+
+type Tone = "dim" | "warning" | "success" | "error";
+
+function tone(item: ItemState): Tone {
+  if (item.status === "queued" || item.status === "skipped") return "dim";
+  if (item.status === "running") return "warning";
+  if (item.status !== "done") return "error";
+  if (item.outcome === "failed") return "error";
+  if (item.outcome === "blocked") return "warning";
+  return "success";
 }
 
 /** Widget above the editor for the active (or just-finished) run. */
@@ -33,15 +51,9 @@ export function buildWidgetLines(run: SwarmRun | null, theme: ThemeLike, now: nu
   // Cap the rows: a large swarm would otherwise push the editor off screen,
   // since a Text-factory widget bypasses pi's ten-line guard.
   const rows = run.items.map((item) => {
-    const paint =
-      item.status === "running"
-        ? (s: string) => theme.fg("warning", s)
-        : item.status === "done"
-          ? (s: string) => theme.fg("success", s)
-          : item.status === "queued"
-            ? dim
-            : (s: string) => theme.fg("error", s);
-    return `${dim("│ ")}${paint(`${icon(item.status)} ${clampWidth(item.agent, 24)}`)}${dim(` ${clampWidth(item.item, 32)}`)}`;
+    const color = tone(item);
+    const paint = (s: string) => theme.fg(color, s);
+    return `${dim("│ ")}${paint(`${icon(item)} ${clampWidth(item.agent, 24)}`)}${dim(` ${clampWidth(item.item, 32)}`)}`;
   });
   for (const row of clampRows(rows, MAX_WIDGET_ROWS, (hidden) => dim(`│ … +${hidden} more`))) {
     lines.push(row);

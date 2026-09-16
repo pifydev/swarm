@@ -3,6 +3,9 @@
  * No imports from pi packages: src/ typechecks and runs standalone.
  */
 
+import type { GateOutcome } from "./gate.ts";
+import type { TaskOutcome, Verification } from "./outcome.ts";
+
 export const VALID_TOOLS = [
   "read",
   "bash",
@@ -48,7 +51,27 @@ export const DEFAULT_CONCURRENCY = 4;
 /** Safe default when no routing rule matches: read-only exploration. */
 export const FALLBACK_AGENT = "scout";
 
-export type ItemStatus = "queued" | "running" | "done" | "error" | "aborted";
+/**
+ * "skipped" is a settled state, not a failure: the item never ran because
+ * something it needed did not produce usable input, and the caller asked for
+ * that to stop the branch rather than feed it a failure notice.
+ */
+export type ItemStatus = "queued" | "running" | "done" | "error" | "aborted" | "skipped";
+
+/** What a gate proved about one item, kept alongside the item it judged. */
+export interface GateRecord {
+  command: string;
+  outcome: GateOutcome;
+  ok: boolean;
+  /** One line in this package's words. */
+  reason: string;
+  /** Trimmed output, kept only when the gate did not pass. */
+  output?: string;
+  /** Other items that were live in the same directory while it ran. */
+  sharedWith?: string[];
+  /** Repair passes spent trying to make it pass. */
+  repairs?: number;
+}
 
 export interface ItemState {
   index: number;
@@ -63,7 +86,17 @@ export interface ItemState {
   tokens: number;
   result: string | null;
   error: string | null;
+  /** The directory the child worked in — its worktree when isolated. */
+  workDir?: string;
+  /** Set once the item settles: what the task came to, apart from whether the child finished. */
+  outcome?: TaskOutcome;
+  /** How well that outcome is known. "not-requested" when no gate ran. */
+  verification?: Verification;
+  gate?: GateRecord;
 }
+
+/** How a dependent behaves when something it needs did not succeed. */
+export type UpstreamFailurePolicy = "continue" | "skip";
 
 /**
  * "cancelled" is its own outcome, not a completion: someone stopped the run,
