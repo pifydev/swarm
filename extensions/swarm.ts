@@ -38,6 +38,7 @@ import {
 } from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { outlasts, settleWithin } from "../src/deadline.ts";
+import { addChildSpend } from "../src/child-cost.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import {
@@ -292,7 +293,7 @@ export default function swarm(pi: ExtensionAPI) {
           event as {
             message?: {
               role?: string;
-              usage?: { totalTokens?: number };
+              usage?: { totalTokens?: number; cost?: { total?: number } };
               content?: Array<{ type?: string; text?: string }>;
             };
           }
@@ -301,6 +302,9 @@ export default function swarm(pi: ExtensionAPI) {
           item.turns++;
           const usage = message.usage;
           if (usage && typeof usage.totalTokens === "number") item.tokens += usage.totalTokens;
+          // A child's spend never reaches the parent's branch; tell the
+          // suite-wide tally so @pify/usage can show it beside the session cost.
+          if (usage) addChildSpend("swarm", { cost: usage.cost?.total, tokens: usage.totalTokens });
 
           // Stop an item that is spinning — restating itself without acting —
           // rather than letting it run to the turn cap. See loop-guard.ts.
