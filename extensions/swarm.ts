@@ -37,6 +37,7 @@ import {
   readConsent,
 } from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
+import { outlasts, settleWithin } from "../src/deadline.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import {
@@ -69,8 +70,10 @@ import { normalizeItems } from "../src/graph.ts";
 import { runGraph } from "../src/schedule.ts";
 import { buildWidgetLines } from "../src/widget.ts";
 import {
+  ABORT_GRACE_MS,
   DEFAULT_CONCURRENCY,
   MAX_ITEMS,
+  RUN_TIMEOUT_MS,
   isRecord,
   type AgentDef,
   type ItemState,
@@ -320,7 +323,17 @@ export default function swarm(pi: ExtensionAPI) {
       });
 
       const prompt = context ? `${context.trim()}\n\nYour item: ${item.item}` : item.item;
-      await session.prompt(prompt, { source: "extension" } as never);
+      // An item has a clock as well as a turn cap: the cap and the loop guard
+      // act at message_end, and a tool whose execute() never resolves emits
+      // none — the item, its concurrency slot, and a parent blocking on the
+      // whole run would be stranded.
+      const prompting = session.prompt(prompt, { source: "extension" } as never);
+      let timedOut = false;
+      if (await outlasts(prompting, RUN_TIMEOUT_MS)) {
+        timedOut = true;
+        void session.abort().catch(() => {});
+        await settleWithin(prompting, ABORT_GRACE_MS);
+      }
 
       const messages = session.messages as Array<{
         role?: string;
@@ -347,6 +360,12 @@ export default function swarm(pi: ExtensionAPI) {
             ? "error"
             : "done";
       if (item.status === "error") item.error = text || "child session error";
+      if (timedOut) {
+        // Whatever the last message's stop reason says, the clock ended this
+        // item; say so the way a user stop is said.
+        item.status = "aborted";
+        item.error = cancelNote("timeout", 1);
+      }
       // A child that stopped cleanly and said nothing has not answered — the
       // fix subagent already carries and this executor never received. Left
       // as "done", a reasoning-only finish (measured on anthropic/claude-opus-5

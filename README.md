@@ -98,7 +98,8 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 
 ## Behaviour
 
-- **Independence by design.** Items share nothing, children cannot spawn children, and each child is capped at its agent's `max_turns`.
+- **Independence by design.** Items share nothing, children cannot spawn children, and each child is capped at its agent's `max_turns` — and at 60 minutes of wall-clock, so a tool that never returns cannot hold a concurrency slot (or a blocking `swarm_run`) forever; such an item is reported as aborted with the reason.
+- **A report is the children's words, and is framed as such.** The aggregated report carries a one-line note that it is model output with no user authority, and no item's text can close the `<swarm_result>` wrapper early or contain a literal control tag such as `<system-reminder>` — the same neutralization memory and btw apply to their blocks.
 - **Stopping stops the children.** Pressing Esc stops a foreground run, `/swarm stop [runId]` stops a background one (its tool call returned long ago, so Esc has nothing to reach), and switching away from the session stops both — in every case every live child is aborted rather than left talking to the provider on your money. A cancelled run keeps that verdict — it is never reported as done — and `swarm_status` shows what the items that did finish produced, with each stopped item saying who stopped it.
 - **Isolated runs clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; otherwise a read-only step left one of each behind on every run. Anything uncommitted, and any commit the child made, is kept and reported.
 

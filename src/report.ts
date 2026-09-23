@@ -1,4 +1,5 @@
 import { outcomeLine } from "./outcome.ts";
+import { UNTRUSTED_REPORT_NOTE, neutralizeReport } from "./pending.ts";
 import type { ItemState, SwarmRun } from "./types.ts";
 
 /** Longest gate output kept per item; a failing suite prints books. */
@@ -56,12 +57,15 @@ export function buildReport(run: SwarmRun): string {
     ...(counts.skipped ? [`${counts.skipped} skipped`] : []),
   ].join(", ");
 
-  const header = `[swarm ${run.runId}] ${run.items.length} items — ${tally}`;
+  // Every item's text is a child's words: it cannot forge the harness's
+  // control tags, and the reader is told once, up front, whose words they are.
+  const header = `[swarm ${run.runId}] ${run.items.length} items — ${tally}\n${UNTRUSTED_REPORT_NOTE}`;
+  const framed = (text: string) => neutralizeReport(text, "swarm");
 
   const sections = run.items.map((item) => {
     const label = `### ${item.index + 1}. [${item.agent}] ${item.item}`;
-    if (item.status === "done") return `${label}\n${item.result ?? "(empty report)"}${verdict(item)}`;
-    if (item.status === "error") return `${label}\nError: ${item.error ?? "unknown"}${verdict(item)}`;
+    if (item.status === "done") return `${label}\n${item.result ? framed(item.result) : "(empty report)"}${verdict(item)}`;
+    if (item.status === "error") return `${label}\nError: ${framed(item.error ?? "unknown")}${verdict(item)}`;
     if (item.status === "skipped") {
       return `${label}\nSkipped — ${item.error ?? "something it needed did not succeed"}. Nothing ran, so nothing was spent on it.`;
     }
@@ -71,7 +75,7 @@ export function buildReport(run: SwarmRun): string {
       // to guess which one it was.
       // cancelNote ends its sentence itself; do not add a second period.
       const why = (item.error ?? "turn cap or stop").replace(/\.$/, "");
-      return `${label}\nAborted — ${why}. Partial:\n${item.result ?? "(none)"}`;
+      return `${label}\nAborted — ${why}. Partial:\n${item.result ? framed(item.result) : "(none)"}`;
     }
     return `${label}\n(${item.status})`;
   });
