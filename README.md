@@ -98,6 +98,7 @@ The catalog is the same `.pi/agents/*.md` one [`@pify/subagent`](https://github.
 
 ## Behaviour
 
+- **A warned ending.** One turn before an item's cap the child is told, by a steering message, that the next turn is its last and should be the report, so a capped item usually ends on a synthesized answer rather than mid-exploration (caps under 4 turns are not warned).
 - **Independence by design.** Items share nothing, children cannot spawn children, and each child is capped at its agent's `max_turns` — and at 60 minutes of wall-clock, so a tool that never returns cannot hold a concurrency slot (or a blocking `swarm_run`) forever; such an item is reported as aborted with the reason.
 - **What the children cost is shown.** Every child message's cost and tokens go to a process-wide tally; with [`@pify/usage`](https://github.com/pifydev/usage) installed the footer shows it as ` · agents $…` beside the session's own cost, which child sessions otherwise never reach.
 - **A report is the children's words, and is framed as such.** The aggregated report carries a one-line note that it is model output with no user authority, and no item's text can close the `<swarm_result>` wrapper early or contain a literal control tag such as `<system-reminder>` — the same neutralization memory and btw apply to their blocks.

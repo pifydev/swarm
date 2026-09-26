@@ -39,6 +39,7 @@ import {
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { outlasts, settleWithin } from "../src/deadline.ts";
 import { addChildSpend } from "../src/child-cost.ts";
+import { shouldWrapUp, wrapUpNotice } from "../src/wrap-up.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
 import {
@@ -223,6 +224,7 @@ export default function swarm(pi: ExtensionAPI) {
     let unsubscribe: (() => void) | null = null;
     let releaseLive: (() => void) | null = null;
     let stallReason: string | null = null;
+    let wrapUpSent = false;
     try {
       let model = ctx.model ?? null;
       if (def.model) {
@@ -322,6 +324,12 @@ export default function swarm(pi: ExtensionAPI) {
           }
 
           renderWidget();
+          // One turn before the cap, say so: the item's last turn becomes a
+          // report instead of one more tool call.
+          if (shouldWrapUp(item.turns, def.maxTurns, wrapUpSent)) {
+            wrapUpSent = true;
+            void session?.steer(wrapUpNotice(def.maxTurns)).catch(() => {});
+          }
           if (item.turns >= def.maxTurns) void session?.abort().catch(() => {});
         }
       });
