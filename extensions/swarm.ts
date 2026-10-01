@@ -39,9 +39,12 @@ import {
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { outlasts, settleWithin } from "../src/deadline.ts";
 import { addChildSpend } from "../src/child-cost.ts";
-import { shouldWrapUp, wrapUpNotice } from "../src/wrap-up.ts";
+import { shouldAbort, shouldWrapUp, wrapUpNotice } from "../src/wrap-up.ts";
+import { childTokens } from "../src/tokens.ts";
+import { resolveChildModel } from "../src/child-model.ts";
+import { findPinnedModel } from "../src/model-match.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
-import { createIsolationWorktree, isolationNote, removeIfUnchanged } from "../src/isolate.ts";
+import { createIsolationWorktree, isolationNote, removeIfUnchanged, isolationPromptNote, repoToplevel } from "../src/isolate.ts";
 import {
   MAILBOX_INBOX_TOOL,
   MAILBOX_POST_TOOL,
@@ -228,12 +231,19 @@ export default function swarm(pi: ExtensionAPI) {
     try {
       let model = ctx.model ?? null;
       if (def.model) {
-        const [provider, ...rest] = def.model.split("/");
-        const found =
-          provider && rest.length > 0 ? ctx.modelRegistry.find(provider, rest.join("/")) : undefined;
-        if (found) model = found;
+        // Exact, then normalized-exact within the provider; a miss used to be
+        // silent here and the item ran on the parent session's model.
+        const pinned = findPinnedModel(ctx.modelRegistry, def.model);
+        if (pinned.model) model = pinned.model;
+        else notify(ctx, `swarm ${runId} item ${item.index + 1}: ${pinned.reason} — using session model`, "warning");
       }
       if (!model) throw new Error("No model available");
+      // pi 0.99: a virtual selection cannot drive a child session (the fresh
+      // runtime inside createAgentSession has no router); take the physical
+      // model the host last routed to. See src/child-model.ts.
+      const resolved = resolveChildModel(model, ctx.sessionManager.getBranch() as unknown[], (p, i) => ctx.modelRegistry.find(p, i));
+      if (!resolved.ok) throw new Error(resolved.reason);
+      model = resolved.model;
 
       const promptHost = ctx as unknown as {
         getSystemPromptOptions?: () => { customPrompt?: string; appendSystemPrompt?: string };
@@ -268,6 +278,8 @@ export default function swarm(pi: ExtensionAPI) {
             "information you do not have) or `OUTCOME: failed` (you tried and it does not work), so the swarm does not " +
             "have to infer it from your prose. Say nothing if it went fine.",
           ...(mailbox ? [mailboxPrompt(item.agent + "-" + item.index)] : []),
+          // Isolated: say which tree is writable (tools take absolute paths).
+          ...(workDir ? [isolationPromptNote(workDir, repoToplevel(ctx.cwd))] : []),
         ],
       });
       await loader.reload();
@@ -295,7 +307,7 @@ export default function swarm(pi: ExtensionAPI) {
           event as {
             message?: {
               role?: string;
-              usage?: { totalTokens?: number; cost?: { total?: number } };
+              usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } };
               content?: Array<{ type?: string; text?: string }>;
             };
           }
@@ -303,10 +315,12 @@ export default function swarm(pi: ExtensionAPI) {
         if (event.type === "message_end" && message?.role === "assistant") {
           item.turns++;
           const usage = message.usage;
-          if (usage && typeof usage.totalTokens === "number") item.tokens += usage.totalTokens;
+          // input + output + cacheWrite: totalTokens would count the cached
+          // prefix once per turn (see src/tokens.ts).
+          if (usage) item.tokens += childTokens(usage);
           // A child's spend never reaches the parent's branch; tell the
           // suite-wide tally so @pify/usage can show it beside the session cost.
-          if (usage) addChildSpend("swarm", { cost: usage.cost?.total, tokens: usage.totalTokens });
+          if (usage) addChildSpend("swarm", { cost: usage.cost?.total, tokens: childTokens(usage) });
 
           // Stop an item that is spinning — restating itself without acting —
           // rather than letting it run to the turn cap. See loop-guard.ts.
@@ -330,7 +344,9 @@ export default function swarm(pi: ExtensionAPI) {
             wrapUpSent = true;
             void session?.steer(wrapUpNotice(def.maxTurns)).catch(() => {});
           }
-          if (item.turns >= def.maxTurns) void session?.abort().catch(() => {});
+          // The cap plus a short grace: the wrap-up above invited one last
+          // tool call, and the report comes the turn after it.
+          if (shouldAbort(item.turns, def.maxTurns)) void session?.abort().catch(() => {});
         }
       });
 
