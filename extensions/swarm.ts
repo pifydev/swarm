@@ -22,8 +22,8 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { StringEnum } from "../src/string-enum.ts";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { withUiLock } from "../src/ui-lock.ts";
